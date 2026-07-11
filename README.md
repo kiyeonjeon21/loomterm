@@ -47,6 +47,10 @@ Register a workspace explicitly:
 target/release/loom workspace add . --name loomterm
 ```
 
+Registration is idempotent for the same name and canonical root. `workspace
+remove` deactivates command execution and project selection without deleting
+durable history; adding the same workspace again reactivates its existing id.
+
 Run a direct command. The CLI streams the original stdout/stderr and exits with
 the child command's exit code:
 
@@ -165,7 +169,8 @@ without gaps or duplicates.
 
 SQLite runs on a dedicated storage actor thread. Async execution and socket tasks
 use a bounded queue and output batches instead of performing synchronous database
-work on Tokio workers.
+work on Tokio workers. Statistics use bounded SQL aggregates rather than loading
+command and environment metadata for every matching execution.
 
 ## Development
 

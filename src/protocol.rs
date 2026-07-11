@@ -8,6 +8,7 @@ use crate::model::{
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const CAPABILITY_EXECUTION_STATS: &str = "execution_stats_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -185,6 +186,8 @@ impl From<&Error> for ProtocolError {
             Error::InvalidRequest(_) => "invalid_request",
             Error::AlreadyTerminal(_) => "already_terminal",
             Error::PermissionDenied(_) => "permission_denied",
+            Error::ProtocolVersionMismatch { .. } => "protocol_version_mismatch",
+            Error::DaemonUpgradeRequired { .. } => "daemon_upgrade_required",
             Error::DaemonDraining => "daemon_draining",
             Error::Timeout => "timeout",
             Error::Config(_) => "configuration_error",

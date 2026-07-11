@@ -92,7 +92,7 @@ the terminal `cancelled` state and was available through `loom_wait` or
 | --- | --- | --- | --- |
 | MCP direct and shell execution | Structured stdout and outcomes matched exactly | None | Core structured execution is usable |
 | Cursor reconnect | Delayed `reconnect-ok` output replayed once with contiguous sequence numbers | None | No reconnect defect observed |
-| Cancellation | `loom cancel` can acknowledge while the returned record still says `running` | Follow with `loom wait` or `loom get` | Clarify asynchronous cancellation semantics; not a reliability blocker |
+| Cancellation | The evaluated build could acknowledge while the returned record still said `running` | Follow with `loom wait` or `loom get` | Resolved after the run: cancel now waits for the terminal record |
 | Interactive probe | A shell `read` received EOF and exited 1 without a PTY | Use non-interactive flags or initial stdin | Known capability gap, but no real task was blocked |
 | Initial activation | Use still depends on a source build, workspace registration, and project MCP configuration | Follow the repository setup steps | Packaging and onboarding are now the largest observed product gap |
 

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
@@ -124,6 +125,13 @@ enum DaemonCommand {
     Start,
     Status,
     Stop,
+    Restart {
+        #[arg(
+            long,
+            help = "Restart even when active execution count is non-zero or unknown"
+        )]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -141,10 +149,13 @@ async fn main() {
 async fn run(cli: Cli) -> Result<i32> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
-    let client = if cli.no_autostart {
-        DaemonClient::new(&paths.socket)
-    } else {
-        DaemonClient::connect_or_start(&paths).await?
+    let client = match &cli.command {
+        Commands::Daemon(DaemonCommand::Start) => DaemonClient::connect_or_start(&paths).await?,
+        Commands::Daemon(
+            DaemonCommand::Status | DaemonCommand::Stop | DaemonCommand::Restart { .. },
+        ) => DaemonClient::new(&paths.socket),
+        _ if cli.no_autostart => DaemonClient::new(&paths.socket),
+        _ => DaemonClient::connect_or_start(&paths).await?,
     };
 
     match cli.command {
@@ -208,6 +219,9 @@ async fn run(cli: Cli) -> Result<i32> {
                         println!("loomd stopped");
                     }
                 }
+                DaemonCommand::Restart { force } => {
+                    restart_daemon(&client, &paths, force, cli.json).await?;
+                }
             }
             Ok(0)
         }
@@ -225,6 +239,17 @@ async fn run(cli: Cli) -> Result<i32> {
             } else {
                 println!("daemon: ok (pid {})", health.daemon_pid);
                 println!("protocol: v{}", health.protocol_version);
+                println!(
+                    "server: {}",
+                    health.server_version.as_deref().unwrap_or("unknown")
+                );
+                println!("capabilities: {}", health.capabilities.join(", "));
+                println!(
+                    "active executions: {}",
+                    health
+                        .active_executions
+                        .map_or_else(|| "unknown".into(), |count| count.to_string())
+                );
                 println!("socket: {}", health.socket_path);
                 println!("database: {}", health.database_path);
                 println!("workspaces: {}", workspaces.len());
@@ -232,6 +257,41 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+async fn restart_daemon(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    let health = client.health().await?;
+    if !force {
+        match health.active_executions {
+            Some(0) => {}
+            Some(count) => {
+                return Err(Error::InvalidRequest(format!(
+                    "daemon has {count} active execution(s); wait for them or use --force"
+                )));
+            }
+            None => {
+                return Err(Error::InvalidRequest(
+                    "daemon does not report active executions; use --force to restart it".into(),
+                ));
+            }
+        }
+    }
+
+    client.shutdown().await?;
+    for _ in 0..600 {
+        if !paths.socket.exists() {
+            let restarted = DaemonClient::connect_or_start(paths).await?;
+            print_value(&restarted.health().await?, json)?;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::Timeout)
 }
 
 async fn handle_workspace(

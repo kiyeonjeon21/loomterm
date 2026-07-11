@@ -17,7 +17,8 @@ use crate::config::{AppPaths, Settings};
 use crate::executor::ExecutionEngine;
 use crate::model::{ExecutionEventPayload, Health, PROTOCOL_VERSION, now_ms};
 use crate::protocol::{
-    MAX_FRAME_BYTES, Operation, ProtocolResult, SubscriptionResponse, WireMessage,
+    CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation, ProtocolResult, SubscriptionResponse,
+    WireMessage,
 };
 use crate::store::Store;
 use crate::{Error, Result};
@@ -312,6 +313,9 @@ async fn dispatch(
             daemon_pid: std::process::id(),
             database_path: paths.database.to_string_lossy().into_owned(),
             socket_path: paths.socket.to_string_lossy().into_owned(),
+            server_version: Some(env!("CARGO_PKG_VERSION").into()),
+            capabilities: vec![CAPABILITY_EXECUTION_STATS.into()],
+            active_executions: Some(engine.active_executions()),
         })),
         Operation::WorkspaceAdd { name, root } => Ok(ProtocolResult::Workspace(
             store.add_workspace(&name, Path::new(&root)).await?,

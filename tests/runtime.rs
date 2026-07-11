@@ -180,18 +180,53 @@ async fn cancels_the_running_process_group() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    engine.cancel(&execution.id).await.unwrap();
-    let final_execution = tokio::time::timeout(
-        Duration::from_secs(5),
-        wait_terminal(&engine, &execution.id),
-    )
-    .await
-    .unwrap();
+    let final_execution = engine.cancel(&execution.id).await.unwrap();
     assert_eq!(final_execution.state, ExecutionState::Cancelled);
     assert!(matches!(
         final_execution.outcome,
         Some(ExecutionOutcome::Cancelled { .. })
     ));
+}
+
+#[tokio::test]
+async fn cancel_waits_for_sigkill_escalation() {
+    let temp = TempDir::new().unwrap();
+    let store = Store::open(&temp.path().join("loom.db")).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
+    let mut settings = settings();
+    settings.cancel_grace_ms = 50;
+    let engine = ExecutionEngine::new(store, settings);
+    let execution = engine
+        .execute(request(
+            workspace.id,
+            CommandSpec::Shell {
+                command: "trap '' TERM; while :; do sleep 1; done".into(),
+                shell: None,
+            },
+        ))
+        .await
+        .unwrap();
+    loop {
+        if engine
+            .store()
+            .get_execution(&execution.id)
+            .await
+            .unwrap()
+            .state
+            == ExecutionState::Running
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let cancelled = engine.cancel(&execution.id).await.unwrap();
+    assert_eq!(cancelled.state, ExecutionState::Cancelled);
+    assert_eq!(
+        cancelled.outcome,
+        Some(ExecutionOutcome::Cancelled { signal: Some(9) })
+    );
 }
 
 #[tokio::test]
@@ -266,6 +301,88 @@ async fn daemon_keeps_execution_across_client_connections() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn daemon_status_and_stop_do_not_autostart() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+
+    for action in ["status", "stop"] {
+        let output = loom_command(&paths)
+            .args(["daemon", action])
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("daemon is unavailable"),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!paths.socket.exists());
+    }
+}
+
+#[tokio::test]
+async fn daemon_restart_requires_force_for_active_executions() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut original_daemon = spawn_daemon_process(&paths);
+    let client = wait_for_daemon(&paths).await;
+    let original_pid = client.health().await.unwrap().daemon_pid;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let execution = client
+        .execute(request(
+            workspace.id,
+            CommandSpec::Argv {
+                program: "/bin/sleep".into(),
+                args: vec!["30".into()],
+            },
+        ))
+        .await
+        .unwrap();
+    wait_running(&client, &execution.id).await;
+
+    let refused = loom_command(&paths)
+        .args(["daemon", "restart"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("active execution"));
+    assert_eq!(client.health().await.unwrap().daemon_pid, original_pid);
+
+    let restarted = loom_command(&paths)
+        .args(["daemon", "restart", "--force", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    original_daemon.wait().await.unwrap();
+
+    let restarted_client = wait_for_daemon(&paths).await;
+    let health = restarted_client.health().await.unwrap();
+    assert_ne!(health.daemon_pid, original_pid);
+    assert_eq!(health.active_executions, Some(0));
+    assert!(
+        health
+            .capabilities
+            .iter()
+            .any(|value| value == loomterm::protocol::CAPABILITY_EXECUTION_STATS)
+    );
+    assert_eq!(
+        restarted_client.get(execution.id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    restarted_client.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -670,4 +787,14 @@ fn spawn_daemon_process(paths: &AppPaths) -> tokio::process::Child {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     command.spawn().unwrap()
+}
+
+fn loom_command(paths: &AppPaths) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_loom"));
+    command
+        .env("LOOMTERM_STATE_DIR", &paths.state_dir)
+        .env("LOOMTERM_RUNTIME_DIR", &paths.runtime_dir)
+        .env("LOOMTERM_CONFIG", &paths.config_file)
+        .stdin(Stdio::null());
+    command
 }

@@ -11,6 +11,7 @@ agent orchestrator, or an LLM client.
 ## What it provides
 
 - A persistent `loomd` daemon with bounded concurrent execution.
+- A private per-command supervisor that terminates the process group if `loomd` dies.
 - Direct argv execution and explicit `/bin/sh -c` execution as distinct modes.
 - Lossless stdout/stderr events with a daemon-assigned merged sequence.
 - Durable command metadata, output, exit codes, and signals in SQLite WAL.
@@ -18,8 +19,10 @@ agent orchestrator, or an LLM client.
 - Process-group cancellation with `SIGTERM` and `SIGKILL` escalation.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
 
-Client disconnection does not stop a command. A daemon crash currently marks
-incomplete records as `interrupted`; v0 does not reattach to surviving processes.
+Client disconnection does not stop a command. A daemon crash closes the private
+supervisor control pipe, which sends `SIGTERM` and then `SIGKILL` to the command
+process group. On restart, the durable record becomes `interrupted`; Loomterm
+deliberately does not reattach to an unowned process.
 
 ## Build
 
@@ -27,11 +30,12 @@ incomplete records as `interrupted`; v0 does not reattach to surviving processes
 cargo build --release
 ```
 
-The build produces three binaries:
+The build produces four binaries:
 
 - `loomd`: execution daemon
 - `loom`: CLI client
 - `loom-mcp`: MCP stdio adapter
+- `loom-supervisor`: private fail-closed process owner used by `loomd`
 
 The CLI and MCP adapter start a sibling `loomd` automatically when needed.
 
@@ -70,16 +74,14 @@ the initial execution, each event, and the terminal result.
 
 ## MCP setup
 
-Point an MCP client at the absolute `loom-mcp` binary path:
+This repository includes a project-scoped Codex configuration in
+`.codex/config.toml`. Register the project once, then open Codex from this trusted
+repository:
 
-```json
-{
-  "mcpServers": {
-    "loomterm": {
-      "command": "/absolute/path/to/loomterm/target/release/loom-mcp"
-    }
-  }
-}
+```sh
+cargo build --release --bins
+target/release/loom workspace add . --name loomterm
+codex mcp get loomterm --json
 ```
 
 The server exposes:
@@ -92,9 +94,14 @@ The server exposes:
 - `loom_list`
 - `loom_workspaces`
 
-When a client advertises MCP roots, `loom-mcp` intersects them with Loomterm's
-explicit workspace registry. Clients without roots can still use registered
-workspaces; the daemon remains restricted to those workspace roots.
+`loom-mcp` selects the most specific registered workspace containing its startup
+directory. Its tool schemas do not accept a workspace parameter, and every
+execution-id operation verifies that the record belongs to that one project.
+Startup fails with a registration command when no workspace contains the project.
+
+MCP output defaults to text with a 256 KiB raw-byte budget. Invalid UTF-8 is
+reported with `lossy: true`; callers can request `output_format = "base64"` for
+the exact bytes. Tool responses expose `next_seq` and `has_more` for paging.
 
 ## Configuration
 
@@ -114,6 +121,8 @@ retention_days = 7
 retention_bytes = 1073741824
 cancel_grace_ms = 2000
 shell = "/bin/sh"
+# Optional development override; production builds find the sibling binary.
+supervisor_path = "/absolute/path/to/loom-supervisor"
 ```
 
 Environment override values and initial stdin are never persisted. Only
@@ -126,11 +135,18 @@ terminal state. A non-zero command exit remains a successfully observed
 `exited { code }` outcome rather than a runtime failure.
 
 Output is exact within each stdout/stderr stream. The cross-stream sequence is
-the order in which `loomd` receives chunks from the two pipes; operating systems
-do not provide a stronger total ordering across separate file descriptors.
+the order in which the supervisor observes chunks from the two pipes; operating
+systems do not provide a stronger total ordering across separate file descriptors.
 
-The internal Unix socket uses length-prefixed JSON protocol v1. SQLite tables
-for workspaces, executions, and events are the authoritative state.
+The internal Unix socket uses length-prefixed JSON protocol v2 with tagged
+request, response, and event envelopes. `Subscribe { execution_id, after_seq }`
+replays durable events after the cursor and then pushes live events on the same
+connection. SQLite tables remain authoritative, so a reconnect can resume
+without gaps or duplicates.
+
+SQLite runs on a dedicated storage actor thread. Async execution and socket tasks
+use a bounded queue and output batches instead of performing synchronous database
+work on Tokio workers.
 
 ## Development
 
@@ -138,16 +154,25 @@ for workspaces, executions, and events are the authoritative state.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+scripts/codex-smoke.sh
 ```
 
-The integration suite covers separate output streams, non-zero exits, workspace
-escape rejection, capture truncation, process-group cancellation, and reconnecting
-through a fresh client connection.
+The integration suite also kills `loomd` with `SIGKILL`, verifies that the
+supervisor removes the command group, proves queued work cannot spawn during
+graceful shutdown, and checks cursor-exact subscription reconnects.
+
+## Trust boundary
+
+Workspace registration constrains `cwd` and MCP record selection. It is not an
+OS filesystem or network sandbox. Commands inherit the permissions and baseline
+environment of the local user running `loomd`; only use Loomterm with trusted
+agents and review destructive tool calls. Environment override values and stdin
+are not persisted, but command processes can access resources available to that
+user.
 
 ## Current scope
 
-macOS and Linux are the v0 targets. PTY/TUI control, SSH, remote daemons, GUI,
+macOS and Linux are the current targets. PTY/TUI control, SSH, remote daemons, GUI,
 ACP hosting, and model orchestration are intentionally deferred. A future PTY
 mode should extend the same execution/event model with terminal snapshots,
 input-required events, and explicit human/agent handoff.
-

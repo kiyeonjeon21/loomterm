@@ -111,6 +111,10 @@ impl ExecutionEngine {
         self.fatal.subscribe()
     }
 
+    pub fn active_executions(&self) -> u64 {
+        self.active.load(Ordering::SeqCst) as u64
+    }
+
     pub async fn execute(&self, mut request: ExecutionRequest) -> Result<Execution> {
         request.validate()?;
         let lifecycle = self.lifecycle.lock().await;
@@ -395,39 +399,63 @@ impl ExecutionEngine {
     }
 
     pub async fn cancel(&self, id: &str) -> Result<Execution> {
-        let _transition = self.transitions.lock().await;
-        let execution = self.store.get_execution(id).await?;
-        let control = self.processes.lock().await.get(id).cloned();
-        match execution.state {
-            ExecutionState::Queued => {
-                let event = self
-                    .store
-                    .finish(
-                        id,
-                        ExecutionState::Cancelled,
-                        ExecutionOutcome::Cancelled { signal: None },
-                    )
-                    .await?;
-                self.notify(event);
-                if let Some(control) = control {
-                    let _ = control.sender.send(SupervisorCommand::Cancel).await;
+        let mut receiver = self.events.subscribe();
+        {
+            let _transition = self.transitions.lock().await;
+            let execution = self.store.get_execution(id).await?;
+            let control = self.processes.lock().await.get(id).cloned();
+            match execution.state {
+                ExecutionState::Queued => {
+                    let event = self
+                        .store
+                        .finish(
+                            id,
+                            ExecutionState::Cancelled,
+                            ExecutionOutcome::Cancelled { signal: None },
+                        )
+                        .await?;
+                    self.notify(event);
+                    if let Some(control) = control {
+                        let _ = control.sender.send(SupervisorCommand::Cancel).await;
+                    }
+                }
+                ExecutionState::Running => {
+                    let control = control.ok_or_else(|| {
+                        Error::Protocol(format!(
+                            "execution {id} is running but has no supervisor handle"
+                        ))
+                    })?;
+                    control
+                        .sender
+                        .send(SupervisorCommand::Cancel)
+                        .await
+                        .map_err(|_| Error::Protocol("supervisor control writer stopped".into()))?;
+                }
+                _ => return Err(Error::AlreadyTerminal(id.into())),
+            }
+        }
+
+        let timeout = Duration::from_millis(
+            self.settings
+                .cancel_grace_ms
+                .saturating_add(SHUTDOWN_SETTLE_MS),
+        );
+        tokio::time::timeout(timeout, async {
+            loop {
+                let execution = self.store.get_execution(id).await?;
+                if execution.state.is_terminal() {
+                    return Ok(execution);
+                }
+                match receiver.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(Error::Protocol("execution event channel closed".into()));
+                    }
                 }
             }
-            ExecutionState::Running => {
-                let control = control.ok_or_else(|| {
-                    Error::Protocol(format!(
-                        "execution {id} is running but has no supervisor handle"
-                    ))
-                })?;
-                control
-                    .sender
-                    .send(SupervisorCommand::Cancel)
-                    .await
-                    .map_err(|_| Error::Protocol("supervisor control writer stopped".into()))?;
-            }
-            _ => return Err(Error::AlreadyTerminal(id.into())),
-        }
-        self.store.get_execution(id).await
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
     }
 
     pub async fn wait(

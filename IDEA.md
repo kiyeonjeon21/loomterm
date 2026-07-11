@@ -12,7 +12,8 @@ release build, git 확인, shell pipeline, non-zero, cancel, cursor reconnect를
   재확인했지만, 실제 작업에서 interactive blocker는 없었다.
 - `loom cancel`은 요청을 접수한 직후 아직 `running`인 record를 반환할 수 있어
   `wait/get` 후속 확인이 필요했다. 이는 문서화할 API 의미 문제이지 lifecycle
-  reliability 결함은 아니다.
+  reliability 결함은 아니다. 후속 runtime-contract 수정에서 cancel 성공 응답을
+  terminal record로 고정했다.
 - 실제 사용을 시작하려면 source build, workspace 등록, project MCP 설정이
   필요했다. 안정적인 execution substrate 이후 가장 큰 마찰은 활성화 과정이다.
 

@@ -69,6 +69,11 @@ target/release/loom logs --follow EXECUTION_ID
 target/release/loom cancel EXECUTION_ID
 ```
 
+`loom cancel` returns after the execution reaches a terminal `cancelled` state.
+`loom daemon status` and `loom daemon stop` never start a missing daemon. After
+upgrading the binaries, use `loom daemon restart`; it refuses to interrupt active
+executions unless `--force` is explicit.
+
 Use `--json` for structured output. `loom run --json` emits JSON Lines containing
 the initial execution, each event, and the terminal result.
 
@@ -150,7 +155,10 @@ the order in which the supervisor observes chunks from the two pipes; operating
 systems do not provide a stronger total ordering across separate file descriptors.
 
 The internal Unix socket uses length-prefixed JSON protocol v2 with tagged
-request, response, and event envelopes. `Subscribe { execution_id, after_seq }`
+request, response, and event envelopes. Daemon health advertises its build
+version, active execution count, and additive protocol capabilities so a newer
+client can request an explicit restart instead of replacing a running daemon.
+`Subscribe { execution_id, after_seq }`
 replays durable events after the cursor and then pushes live events on the same
 connection. SQLite tables remain authoritative, so a reconnect can resume
 without gaps or duplicates.

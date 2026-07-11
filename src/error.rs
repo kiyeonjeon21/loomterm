@@ -22,6 +22,12 @@ pub enum Error {
     InvalidRequest(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error(
+        "daemon protocol version {daemon} is incompatible with client protocol version {client}"
+    )]
+    ProtocolVersionMismatch { client: u32, daemon: u32 },
+    #[error("daemon process {daemon_pid} does not support {capability}; run `loom daemon restart`")]
+    DaemonUpgradeRequired { daemon_pid: u32, capability: String },
     #[error("daemon is unavailable at {0:?}")]
     DaemonUnavailable(PathBuf),
     #[error("daemon is draining and cannot accept new executions")]

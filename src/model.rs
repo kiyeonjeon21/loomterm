@@ -341,4 +341,10 @@ pub struct Health {
     pub daemon_pid: u32,
     pub database_path: String,
     pub socket_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_executions: Option<u64>,
 }

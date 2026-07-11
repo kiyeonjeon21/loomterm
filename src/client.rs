@@ -14,7 +14,8 @@ use crate::model::{
     WaitResponse, Workspace,
 };
 use crate::protocol::{
-    MAX_FRAME_BYTES, Operation, ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
+    CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation, ProtocolResult, ResponseBody,
+    SubscriptionResponse, WireMessage,
 };
 use crate::{Error, Result};
 
@@ -32,14 +33,18 @@ impl DaemonClient {
 
     pub async fn connect_or_start(paths: &AppPaths) -> Result<Self> {
         let client = Self::new(&paths.socket);
-        if client.health().await.is_ok() {
-            return Ok(client);
+        match client.health().await {
+            Ok(_) => return Ok(client),
+            Err(Error::DaemonUnavailable(_)) => {}
+            Err(error) => return Err(error),
         }
         start_daemon_process()?;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if client.health().await.is_ok() {
-                return Ok(client);
+            match client.health().await {
+                Ok(_) => return Ok(client),
+                Err(Error::DaemonUnavailable(_)) => {}
+                Err(error) => return Err(error),
             }
         }
         Err(Error::DaemonUnavailable(paths.socket.clone()))
@@ -109,6 +114,7 @@ impl DaemonClient {
     }
 
     pub async fn stats(&self, workspace: String, since_ms: i64) -> Result<ExecutionStats> {
+        self.require_capability(CAPABILITY_EXECUTION_STATS).await?;
         match self
             .call(Operation::Stats {
                 workspace,
@@ -208,6 +214,21 @@ impl DaemonClient {
             value => unexpected("empty response", value),
         }
     }
+
+    async fn require_capability(&self, capability: &str) -> Result<()> {
+        let health = self.health().await?;
+        if health
+            .capabilities
+            .iter()
+            .any(|available| available == capability)
+        {
+            return Ok(());
+        }
+        Err(Error::DaemonUpgradeRequired {
+            daemon_pid: health.daemon_pid,
+            capability: capability.to_owned(),
+        })
+    }
 }
 
 pub struct ExecutionSubscription {
@@ -230,9 +251,10 @@ impl ExecutionSubscription {
                 event,
             } => {
                 if version != PROTOCOL_VERSION {
-                    return Err(Error::Protocol(format!(
-                        "unsupported daemon protocol version {version}"
-                    )));
+                    return Err(Error::ProtocolVersionMismatch {
+                        client: PROTOCOL_VERSION,
+                        daemon: version,
+                    });
                 }
                 if subscription_id != self.subscription_id {
                     return Err(Error::Protocol(
@@ -266,9 +288,10 @@ fn decode_response(frame: &[u8], expected_request_id: &str) -> Result<ProtocolRe
         return Err(Error::Protocol("expected daemon response".into()));
     };
     if version != PROTOCOL_VERSION {
-        return Err(Error::Protocol(format!(
-            "unsupported daemon protocol version {version}"
-        )));
+        return Err(Error::ProtocolVersionMismatch {
+            client: PROTOCOL_VERSION,
+            daemon: version,
+        });
     }
     if request_id != expected_request_id {
         return Err(Error::Protocol("response request_id did not match".into()));
@@ -326,4 +349,102 @@ fn unexpected<T>(expected: &str, actual: ProtocolResult) -> Result<T> {
 
 pub fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    async fn serve_health(socket: &Path, response_version: u32, include_capabilities: bool) {
+        let listener = UnixListener::bind(socket).unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_BYTES)
+            .new_codec();
+        let mut framed = Framed::new(stream, codec);
+        let request = framed.next().await.unwrap().unwrap();
+        let request: WireMessage = serde_json::from_slice(&request).unwrap();
+        let WireMessage::Request { request_id, .. } = request else {
+            panic!("expected health request");
+        };
+        let mut health = serde_json::json!({
+            "protocol_version": response_version,
+            "daemon_pid": 42,
+            "database_path": "/tmp/loom.db",
+            "socket_path": socket,
+        });
+        if include_capabilities {
+            health["capabilities"] = serde_json::json!([CAPABILITY_EXECUTION_STATS]);
+        }
+        let response = serde_json::json!({
+            "kind": "response",
+            "version": response_version,
+            "request_id": request_id,
+            "status": "ok",
+            "result": {
+                "type": "health",
+                "value": health,
+            },
+        });
+        framed
+            .send(Bytes::from(serde_json::to_vec(&response).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_requires_a_daemon_capability() {
+        let temp = tempdir().unwrap();
+        let socket = temp.path().join("loomd.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_health(&server_socket, PROTOCOL_VERSION, false).await;
+        });
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = DaemonClient::new(&socket)
+            .stats("workspace".into(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::DaemonUpgradeRequired { daemon_pid: 42, .. }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_or_start_does_not_replace_an_incompatible_daemon() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            state_dir: temp.path().join("state"),
+            runtime_dir: temp.path().join("run"),
+            config_file: temp.path().join("config.toml"),
+            database: temp.path().join("state/loom.db"),
+            socket: temp.path().join("loomd.sock"),
+            lock_file: temp.path().join("loomd.lock"),
+        };
+        let server_socket = paths.socket.clone();
+        let server = tokio::spawn(async move {
+            serve_health(&server_socket, PROTOCOL_VERSION + 1, true).await;
+        });
+        while !paths.socket.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = DaemonClient::connect_or_start(&paths).await.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProtocolVersionMismatch {
+                client: PROTOCOL_VERSION,
+                daemon,
+            } if daemon == PROTOCOL_VERSION + 1
+        ));
+        server.await.unwrap();
+    }
 }

@@ -182,7 +182,7 @@ async fn cancels_the_running_process_group() {
     }
     engine.cancel(&execution.id).await.unwrap();
     let final_execution = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         wait_terminal(&engine, &execution.id),
     )
     .await

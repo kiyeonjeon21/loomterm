@@ -172,7 +172,7 @@ The integration suite also kills `loomd` with `SIGKILL`, verifies that the
 supervisor removes the command group, proves queued work cannot spawn during
 graceful shutdown, and checks cursor-exact subscription reconnects.
 
-Use [DOGFOOD.md](DOGFOOD.md) to collect a seven-day local baseline before choosing
+Use [DOGFOOD.md](DOGFOOD.md) to run a focused local evaluation before choosing
 the next product investment.
 
 ## Trust boundary

@@ -1,7 +1,8 @@
-# Loomterm Dogfood Protocol
+# Loomterm Focused Dogfood Protocol
 
-Use real development work to decide Loomterm's next product investment. This is
-a seven-day local evaluation, not a benchmark and not a telemetry program.
+Use one 30-45 minute session of real development work to choose Loomterm's next
+product investment. This is a local evaluation, not a benchmark and not a
+telemetry program.
 
 ## Setup
 
@@ -16,12 +17,13 @@ target/release/loom doctor
 Capture the starting baseline:
 
 ```sh
-target/release/loom stats --workspace loomterm --days 7 --json > /tmp/loomterm-stats-start.json
+target/release/loom stats --workspace loomterm --days 1 --json > /tmp/loomterm-focused-dogfood-start.json
 ```
 
-## Seven-day run
+## Focused run
 
-Run at least 20 real commands through Loomterm across at least five task types:
+Run at least 12 commands through Loomterm across at least five task types. Use
+both the CLI and a real coding agent connected through `loom-mcp`.
 
 - repository discovery and source inspection
 - builds and dependency checks
@@ -29,49 +31,72 @@ Run at least 20 real commands through Loomterm across at least five task types:
 - formatting and linting
 - version-control or release checks
 
-Do not add synthetic commands just to reach the count. Include normal failures
-and corrections. During the run, exercise these lifecycle paths when real work
-makes them relevant:
+Exercise these lifecycle paths during the same session:
 
-- a successful direct argv command
-- a non-zero exit
-- an explicit shell command for pipes, redirects, or shell expansion
-- a detached command followed by `list` or `logs --follow`
-- cancellation of a long-running command
+- direct argv and explicit shell execution
+- an intentional non-zero exit
+- a detached command followed by a cursor-based wait or log reconnect
+- cancellation followed by terminal-state verification
+- one controlled interactive-input probe
 
-For every task that is blocked or materially degraded, add one row here:
+The controlled probe documents the current pipe-based boundary. It does not
+count as evidence for prioritizing PTY support unless a real task is also
+blocked or materially degraded.
 
-| Date | Task | Signal | Workaround | Product implication |
-| --- | --- | --- | --- | --- |
-| | | shell fallback / interactive prompt / cancel-reconnect / ambiguity | | |
+For every observed friction, record the task, signal, workaround, and product
+implication. Missing, duplicated, reordered, or inaccessible output is a
+reliability issue, not normal friction.
 
-Record a shell fallback only when shell syntax was necessary. Record an
-interactive prompt when the lack of a PTY or follow-up stdin changed the task,
-even if a non-interactive flag provided a workaround. Record any missing,
-duplicated, reordered, or inaccessible output as a reliability issue.
+## Decision gates
 
-## Review
+Capture the final summary with `loom stats --workspace loomterm --days 1` and
+choose the next investment in this order:
 
-At the end of day seven, capture the same local summary:
+1. Fix runtime reliability if any command is lost, duplicated, orphaned, or
+   cannot be resumed correctly.
+2. Prioritize PTY, input-required events, and human handoff when at least two
+   real tasks are blocked or materially degraded by interactive input.
+3. Prioritize a sandbox-policy spike when the trusted workflow exposes a
+   concrete permission or isolation blocker.
+4. Otherwise prioritize packaging, installation, and onboarding.
 
-```sh
-target/release/loom stats --workspace loomterm --days 7
-target/release/loom stats --workspace loomterm --days 7 --json > /tmp/loomterm-stats-end.json
-```
+The summary contains no command text, output contents, environment values, or
+stdin. All source records and derived statistics remain in the local Loomterm
+database; nothing is sent to an external service.
 
-Choose the next investment using the collected evidence:
+## Focused run: 2026-07-12
 
-- Fix lifecycle or output reliability before adding product surface if any real
-  command is lost, duplicated, orphaned, or cannot be resumed correctly.
-- Prioritize PTY and explicit human/agent handoff if at least three real tasks are
-  blocked or materially degraded by interactive input.
-- Prioritize packaging, installation, and sandbox policy if at least 90% of tasks
-  complete through the structured runtime and interactive input is not a blocker.
-- Continue the evaluation instead of choosing a direction if fewer than 20 real
-  commands or five task types were observed.
+The session started from zero execution records and covered discovery,
+dependency metadata, formatting, linting, tests, release builds, version
+control, direct argv, explicit shell, non-zero outcomes, cancellation, and
+cursor-based reconnects.
 
-The summary includes counts, outcomes, initiator kinds, captured byte totals,
-truncation counts, and terminal duration percentiles. It contains no command
-text, output contents, environment values, or stdin. All source records and
-derived statistics remain in the local Loomterm database; nothing is sent to an
-external service.
+| Metric | Result |
+| --- | ---: |
+| Total executions | 15 |
+| Exited zero | 11 |
+| Expected non-zero | 2 |
+| Cancelled | 2 |
+| CLI / MCP initiators | 10 / 5 |
+| Captured output | 10,526 bytes |
+| Truncated executions | 0 |
+| Duration samples | 15 |
+| Duration p50 / p95 | 71 ms / 14,156 ms |
+
+The p95 includes a deliberate `sleep 30` that remained active while Codex
+planned its next MCP call. Once cancellation was requested, the command reached
+the terminal `cancelled` state and was available through `loom_wait` or
+`loom get`.
+
+| Task | Signal | Workaround | Product implication |
+| --- | --- | --- | --- |
+| MCP direct and shell execution | Structured stdout and outcomes matched exactly | None | Core structured execution is usable |
+| Cursor reconnect | Delayed `reconnect-ok` output replayed once with contiguous sequence numbers | None | No reconnect defect observed |
+| Cancellation | `loom cancel` can acknowledge while the returned record still says `running` | Follow with `loom wait` or `loom get` | Clarify asynchronous cancellation semantics; not a reliability blocker |
+| Interactive probe | A shell `read` received EOF and exited 1 without a PTY | Use non-interactive flags or initial stdin | Known capability gap, but no real task was blocked |
+| Initial activation | Use still depends on a source build, workspace registration, and project MCP configuration | Follow the repository setup steps | Packaging and onboarding are now the largest observed product gap |
+
+No output loss, duplication, orphan process, truncation, or real interactive
+blocker was observed. The decision gates therefore select
+**packaging, installation, and onboarding** as the next product slice. PTY and
+sandbox work remain deferred until real usage supplies a blocker.

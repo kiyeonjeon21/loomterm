@@ -17,7 +17,9 @@ async fn main() {
         let paths = AppPaths::discover()?;
         paths.ensure()?;
         let client = DaemonClient::connect_or_start(&paths).await?;
-        let service = LoomMcpServer::new(client)
+        let cwd = std::env::current_dir()?;
+        let service = LoomMcpServer::for_current_project(client, &cwd)
+            .await?
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|error| loomterm::Error::Protocol(error.to_string()))?;

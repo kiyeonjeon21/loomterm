@@ -7,5 +7,6 @@ pub mod mcp;
 pub mod model;
 pub mod protocol;
 pub mod store;
+pub mod supervisor;
 
 pub use error::{Error, Result};

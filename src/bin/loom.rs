@@ -303,40 +303,48 @@ async fn run_command(client: &DaemonClient, args: RunArgs, json: bool) -> Result
 async fn stream_until_finished(
     client: &DaemonClient,
     id: &str,
-    mut cursor: u64,
+    cursor: u64,
     json: bool,
 ) -> Result<Execution> {
-    loop {
-        let response = client.wait(id.into(), cursor, 30_000, 1024 * 1024).await?;
-        for event in &response.events {
-            render_event(event, json)?;
+    let mut subscription = client.subscribe(id.into(), cursor).await?;
+    while let Some(event) = subscription.next_event().await? {
+        let terminal = matches!(&event.payload, ExecutionEventPayload::Finished { .. });
+        render_event(&event, json)?;
+        if terminal {
+            return client.get(id.into()).await;
         }
-        cursor = response.next_seq;
-        if response.execution.state.is_terminal() {
-            return Ok(response.execution);
-        }
+    }
+    let execution = client.get(id.into()).await?;
+    if execution.state.is_terminal() {
+        Ok(execution)
+    } else {
+        Err(Error::Protocol(
+            "execution subscription closed before completion".into(),
+        ))
     }
 }
 
 async fn follow_logs(client: &DaemonClient, args: LogsArgs, json: bool) -> Result<()> {
+    if args.follow {
+        let mut subscription = client
+            .subscribe(args.execution_id.clone(), args.after_seq)
+            .await?;
+        while let Some(event) = subscription.next_event().await? {
+            render_event(&event, json)?;
+        }
+        return Ok(());
+    }
     let mut cursor = args.after_seq;
     loop {
-        let response = if args.follow {
-            let waited = client
-                .wait(args.execution_id.clone(), cursor, 30_000, args.max_bytes)
-                .await?;
-            (waited.execution, waited.events, waited.next_seq)
-        } else {
-            let read = client
-                .read_output(args.execution_id.clone(), cursor, args.max_bytes)
-                .await?;
-            (read.execution, read.events, read.next_seq)
-        };
-        for event in &response.1 {
+        let read = client
+            .read_output(args.execution_id.clone(), cursor, args.max_bytes)
+            .await?;
+        let response = (read.events, read.next_seq, read.has_more);
+        for event in &response.0 {
             render_event(event, json)?;
         }
-        cursor = response.2;
-        if !args.follow || response.0.state.is_terminal() {
+        cursor = response.1;
+        if !response.2 {
             return Ok(());
         }
     }

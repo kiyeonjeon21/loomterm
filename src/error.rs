@@ -6,6 +6,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("storage unavailable: {0}")]
+    StorageUnavailable(String),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("configuration error: {0}")]
@@ -22,6 +24,8 @@ pub enum Error {
     Protocol(String),
     #[error("daemon is unavailable at {0:?}")]
     DaemonUnavailable(PathBuf),
+    #[error("daemon is draining and cannot accept new executions")]
+    DaemonDraining,
     #[error("operation timed out")]
     Timeout,
     #[error("execution is already terminal: {0}")]

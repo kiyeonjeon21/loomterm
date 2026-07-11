@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -256,7 +256,6 @@ pub enum ExecutionEventPayload {
     Output {
         stream: OutputStream,
         data_base64: String,
-        text: String,
     },
     CaptureTruncated {
         limit_bytes: u64,
@@ -288,6 +287,7 @@ pub struct WaitResponse {
     pub execution: Execution,
     pub events: Vec<ExecutionEvent>,
     pub next_seq: u64,
+    pub has_more: bool,
     pub timed_out: bool,
 }
 

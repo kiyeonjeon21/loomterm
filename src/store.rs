@@ -1,8 +1,9 @@
-use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{
     CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
@@ -11,6 +12,7 @@ use crate::model::{
 use crate::{Error, Result};
 
 const SCHEMA_VERSION: i64 = 1;
+const STORE_QUEUE_DEPTH: usize = 512;
 
 #[derive(Debug)]
 pub(crate) enum CaptureRecord {
@@ -27,31 +29,327 @@ pub(crate) enum CaptureRecord {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Store {
-    connection: Arc<Mutex<Connection>>,
+    sender: mpsc::Sender<StoreCommand>,
+}
+
+enum StoreCommand {
+    AddWorkspace {
+        name: String,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<Workspace>>,
+    },
+    RemoveWorkspace {
+        identifier: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetWorkspace {
+        identifier: String,
+        reply: oneshot::Sender<Result<Workspace>>,
+    },
+    FindWorkspaceByRoot {
+        root: PathBuf,
+        reply: oneshot::Sender<Result<Option<Workspace>>>,
+    },
+    ListWorkspaces {
+        reply: oneshot::Sender<Result<Vec<Workspace>>>,
+    },
+    CreateExecution {
+        request: Box<ExecutionRequest>,
+        cwd: PathBuf,
+        reply: oneshot::Sender<Result<Execution>>,
+    },
+    MarkRunning {
+        id: String,
+        pid: u32,
+        pgid: i32,
+        reply: oneshot::Sender<Result<ExecutionEvent>>,
+    },
+    AppendCaptureBatch {
+        records: Vec<CaptureRecord>,
+        reply: oneshot::Sender<Result<Vec<ExecutionEvent>>>,
+    },
+    Finish {
+        id: String,
+        state: ExecutionState,
+        outcome: ExecutionOutcome,
+        reply: oneshot::Sender<Result<ExecutionEvent>>,
+    },
+    GetExecution {
+        id: String,
+        reply: oneshot::Sender<Result<Execution>>,
+    },
+    ListExecutions {
+        workspace: Option<String>,
+        limit: u32,
+        reply: oneshot::Sender<Result<Vec<Execution>>>,
+    },
+    ReadOutput {
+        id: String,
+        after_seq: u64,
+        max_bytes: usize,
+        reply: oneshot::Sender<Result<ReadOutputResponse>>,
+    },
+    ReconcileIncomplete {
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    CancelQueued {
+        reply: oneshot::Sender<Result<Vec<ExecutionEvent>>>,
+    },
+    Prune {
+        retention_days: u64,
+        retention_bytes: u64,
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let connection = Connection::open(path)?;
-        let store = Self {
-            connection: Arc::new(Mutex::new(connection)),
-        };
-        store.initialize()?;
-        Ok(store)
+        Self::spawn(StoreLocation::Path(path.to_path_buf()))
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
-        let store = Self {
-            connection: Arc::new(Mutex::new(Connection::open_in_memory()?)),
+        Self::spawn(StoreLocation::Memory)
+    }
+
+    fn spawn(location: StoreLocation) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel(STORE_QUEUE_DEPTH);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("loomterm-sqlite".into())
+            .spawn(move || match Database::open(location) {
+                Ok(database) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_store_actor(database, receiver);
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            })?;
+        ready_rx.recv().map_err(|_| {
+            Error::StorageUnavailable("storage actor failed during startup".into())
+        })??;
+        Ok(Self { sender })
+    }
+
+    async fn request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> StoreCommand,
+    ) -> Result<T> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(build(reply))
+            .await
+            .map_err(|_| Error::StorageUnavailable("storage actor stopped".into()))?;
+        response
+            .await
+            .map_err(|_| Error::StorageUnavailable("storage actor dropped a response".into()))?
+    }
+
+    pub async fn add_workspace(&self, name: &str, root: &Path) -> Result<Workspace> {
+        self.request(|reply| StoreCommand::AddWorkspace {
+            name: name.to_owned(),
+            root: root.to_path_buf(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_workspace(&self, identifier: &str) -> Result<()> {
+        self.request(|reply| StoreCommand::RemoveWorkspace {
+            identifier: identifier.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn get_workspace(&self, identifier: &str) -> Result<Workspace> {
+        self.request(|reply| StoreCommand::GetWorkspace {
+            identifier: identifier.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn find_workspace_by_root(&self, root: &Path) -> Result<Option<Workspace>> {
+        self.request(|reply| StoreCommand::FindWorkspaceByRoot {
+            root: root.to_path_buf(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        self.request(|reply| StoreCommand::ListWorkspaces { reply })
+            .await
+    }
+
+    pub async fn create_execution(
+        &self,
+        request: &ExecutionRequest,
+        cwd: &Path,
+    ) -> Result<Execution> {
+        self.request(|reply| StoreCommand::CreateExecution {
+            request: Box::new(request.clone()),
+            cwd: cwd.to_path_buf(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn mark_running(&self, id: &str, pid: u32, pgid: i32) -> Result<ExecutionEvent> {
+        self.request(|reply| StoreCommand::MarkRunning {
+            id: id.to_owned(),
+            pid,
+            pgid,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn append_capture_batch(
+        &self,
+        records: Vec<CaptureRecord>,
+    ) -> Result<Vec<ExecutionEvent>> {
+        self.request(|reply| StoreCommand::AppendCaptureBatch { records, reply })
+            .await
+    }
+
+    pub async fn append_output(
+        &self,
+        id: &str,
+        stream: OutputStream,
+        data: &[u8],
+    ) -> Result<ExecutionEvent> {
+        self.append_capture_batch(vec![CaptureRecord::Output {
+            execution_id: id.into(),
+            timestamp_ms: now_ms(),
+            stream,
+            data: data.to_vec(),
+        }])
+        .await?
+        .pop()
+        .ok_or_else(|| Error::Protocol("capture batch produced no event".into()))
+    }
+
+    pub async fn mark_truncated(&self, id: &str, limit: u64) -> Result<ExecutionEvent> {
+        self.append_capture_batch(vec![CaptureRecord::Truncated {
+            execution_id: id.into(),
+            timestamp_ms: now_ms(),
+            limit_bytes: limit,
+        }])
+        .await?
+        .pop()
+        .ok_or_else(|| Error::Protocol("capture batch produced no event".into()))
+    }
+
+    pub async fn finish(
+        &self,
+        id: &str,
+        state: ExecutionState,
+        outcome: ExecutionOutcome,
+    ) -> Result<ExecutionEvent> {
+        self.request(|reply| StoreCommand::Finish {
+            id: id.to_owned(),
+            state,
+            outcome,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn get_execution(&self, id: &str) -> Result<Execution> {
+        self.request(|reply| StoreCommand::GetExecution {
+            id: id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn list_executions(
+        &self,
+        workspace: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Execution>> {
+        self.request(|reply| StoreCommand::ListExecutions {
+            workspace: workspace.map(str::to_owned),
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn read_output(
+        &self,
+        id: &str,
+        after_seq: u64,
+        max_bytes: usize,
+    ) -> Result<ReadOutputResponse> {
+        self.request(|reply| StoreCommand::ReadOutput {
+            id: id.to_owned(),
+            after_seq,
+            max_bytes,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn reconcile_incomplete(&self) -> Result<usize> {
+        self.request(|reply| StoreCommand::ReconcileIncomplete { reply })
+            .await
+    }
+
+    pub async fn cancel_queued(&self) -> Result<Vec<ExecutionEvent>> {
+        self.request(|reply| StoreCommand::CancelQueued { reply })
+            .await
+    }
+
+    pub async fn prune(&self, retention_days: u64, retention_bytes: u64) -> Result<usize> {
+        self.request(|reply| StoreCommand::Prune {
+            retention_days,
+            retention_bytes,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.request(|reply| StoreCommand::Shutdown { reply }).await
+    }
+}
+
+enum StoreLocation {
+    Path(PathBuf),
+    #[cfg(test)]
+    Memory,
+}
+
+struct Database {
+    connection: Mutex<Connection>,
+}
+
+impl Database {
+    fn open(location: StoreLocation) -> Result<Self> {
+        let connection = match location {
+            StoreLocation::Path(path) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Connection::open(path)?
+            }
+            #[cfg(test)]
+            StoreLocation::Memory => Connection::open_in_memory()?,
         };
-        store.initialize()?;
-        Ok(store)
+        let database = Self {
+            connection: Mutex::new(connection),
+        };
+        database.initialize()?;
+        Ok(database)
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -256,32 +554,6 @@ impl Store {
             timestamp_ms: timestamp,
             payload: ExecutionEventPayload::Started { pid, pgid },
         })
-    }
-
-    pub fn append_output(
-        &self,
-        id: &str,
-        stream: OutputStream,
-        data: &[u8],
-    ) -> Result<ExecutionEvent> {
-        self.append_capture_batch(&[CaptureRecord::Output {
-            execution_id: id.into(),
-            timestamp_ms: now_ms(),
-            stream,
-            data: data.to_vec(),
-        }])?
-        .pop()
-        .ok_or_else(|| Error::Protocol("capture batch produced no event".into()))
-    }
-
-    pub fn mark_truncated(&self, id: &str, limit: u64) -> Result<ExecutionEvent> {
-        self.append_capture_batch(&[CaptureRecord::Truncated {
-            execution_id: id.into(),
-            timestamp_ms: now_ms(),
-            limit_bytes: limit,
-        }])?
-        .pop()
-        .ok_or_else(|| Error::Protocol("capture batch produced no event".into()))
     }
 
     pub(crate) fn append_capture_batch(
@@ -490,6 +762,25 @@ impl Store {
         Ok(count)
     }
 
+    pub fn cancel_queued(&self) -> Result<Vec<ExecutionEvent>> {
+        let ids = {
+            let connection = self.connection()?;
+            let mut statement =
+                connection.prepare("SELECT id FROM executions WHERE state = 'queued'")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                self.finish(
+                    &id,
+                    ExecutionState::Cancelled,
+                    ExecutionOutcome::Cancelled { signal: None },
+                )
+            })
+            .collect()
+    }
+
     pub fn prune(&self, retention_days: u64, retention_bytes: u64) -> Result<usize> {
         let cutoff = now_ms() - (retention_days as i64 * 24 * 60 * 60 * 1000);
         let mut connection = self.connection()?;
@@ -527,6 +818,89 @@ impl Store {
         }
         transaction.commit()?;
         Ok(removed)
+    }
+}
+
+fn run_store_actor(database: Database, mut receiver: mpsc::Receiver<StoreCommand>) {
+    while let Some(command) = receiver.blocking_recv() {
+        match command {
+            StoreCommand::AddWorkspace { name, root, reply } => {
+                let _ = reply.send(database.add_workspace(&name, &root));
+            }
+            StoreCommand::RemoveWorkspace { identifier, reply } => {
+                let _ = reply.send(database.remove_workspace(&identifier));
+            }
+            StoreCommand::GetWorkspace { identifier, reply } => {
+                let _ = reply.send(database.get_workspace(&identifier));
+            }
+            StoreCommand::FindWorkspaceByRoot { root, reply } => {
+                let _ = reply.send(database.find_workspace_by_root(&root));
+            }
+            StoreCommand::ListWorkspaces { reply } => {
+                let _ = reply.send(database.list_workspaces());
+            }
+            StoreCommand::CreateExecution {
+                request,
+                cwd,
+                reply,
+            } => {
+                let _ = reply.send(database.create_execution(&request, &cwd));
+            }
+            StoreCommand::MarkRunning {
+                id,
+                pid,
+                pgid,
+                reply,
+            } => {
+                let _ = reply.send(database.mark_running(&id, pid, pgid));
+            }
+            StoreCommand::AppendCaptureBatch { records, reply } => {
+                let _ = reply.send(database.append_capture_batch(&records));
+            }
+            StoreCommand::Finish {
+                id,
+                state,
+                outcome,
+                reply,
+            } => {
+                let _ = reply.send(database.finish(&id, state, outcome));
+            }
+            StoreCommand::GetExecution { id, reply } => {
+                let _ = reply.send(database.get_execution(&id));
+            }
+            StoreCommand::ListExecutions {
+                workspace,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(database.list_executions(workspace.as_deref(), limit));
+            }
+            StoreCommand::ReadOutput {
+                id,
+                after_seq,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(database.read_output(&id, after_seq, max_bytes));
+            }
+            StoreCommand::ReconcileIncomplete { reply } => {
+                let _ = reply.send(database.reconcile_incomplete());
+            }
+            StoreCommand::CancelQueued { reply } => {
+                let _ = reply.send(database.cancel_queued());
+            }
+            StoreCommand::Prune {
+                retention_days,
+                retention_bytes,
+                reply,
+            } => {
+                let _ = reply.send(database.prune(retention_days, retention_bytes));
+            }
+            StoreCommand::Shutdown { reply } => {
+                let _ = reply.send(Ok(()));
+                break;
+            }
+        }
     }
 }
 
@@ -629,7 +1003,6 @@ fn output_event(
         payload: ExecutionEventPayload::Output {
             stream,
             data_base64: base64::engine::general_purpose::STANDARD.encode(data),
-            text: String::from_utf8_lossy(data).into_owned(),
         },
     }
 }
@@ -725,17 +1098,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stores_execution_and_lossless_output() {
+    #[tokio::test]
+    async fn stores_execution_and_lossless_output() {
         let store = Store::in_memory().unwrap();
         let root = tempdir().unwrap();
-        let workspace = store.add_workspace("test", root.path()).unwrap();
+        let workspace = store.add_workspace("test", root.path()).await.unwrap();
         let execution = store
             .create_execution(&request(workspace.id), root.path())
+            .await
             .unwrap();
-        store.mark_running(&execution.id, 42, 42).unwrap();
+        store.mark_running(&execution.id, 42, 42).await.unwrap();
         store
             .append_output(&execution.id, OutputStream::Stdout, b"hello\xff")
+            .await
             .unwrap();
         store
             .finish(
@@ -743,40 +1118,43 @@ mod tests {
                 ExecutionState::Finished,
                 ExecutionOutcome::Exited { code: 0 },
             )
+            .await
             .unwrap();
 
-        let output = store.read_output(&execution.id, 0, 1024).unwrap();
+        let output = store.read_output(&execution.id, 0, 1024).await.unwrap();
         assert_eq!(output.events.len(), 3);
         assert!(output.execution.state.is_terminal());
         assert_eq!(output.execution.captured_bytes, 6);
     }
 
-    #[test]
-    fn reconciles_incomplete_records_and_prunes_only_terminal_history() {
+    #[tokio::test]
+    async fn reconciles_incomplete_records_and_prunes_only_terminal_history() {
         let store = Store::in_memory().unwrap();
         let root = tempdir().unwrap();
-        let workspace = store.add_workspace("test", root.path()).unwrap();
+        let workspace = store.add_workspace("test", root.path()).await.unwrap();
         let running = store
             .create_execution(&request(workspace.id.clone()), root.path())
+            .await
             .unwrap();
-        store.mark_running(&running.id, 42, 42).unwrap();
+        store.mark_running(&running.id, 42, 42).await.unwrap();
         let queued = store
             .create_execution(&request(workspace.id), root.path())
+            .await
             .unwrap();
 
-        assert_eq!(store.reconcile_incomplete().unwrap(), 2);
+        assert_eq!(store.reconcile_incomplete().await.unwrap(), 2);
         assert_eq!(
-            store.get_execution(&running.id).unwrap().state,
+            store.get_execution(&running.id).await.unwrap().state,
             ExecutionState::Interrupted
         );
         assert_eq!(
-            store.get_execution(&queued.id).unwrap().state,
+            store.get_execution(&queued.id).await.unwrap().state,
             ExecutionState::Interrupted
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
-        assert_eq!(store.prune(0, u64::MAX).unwrap(), 2);
+        assert_eq!(store.prune(0, u64::MAX).await.unwrap(), 2);
         assert!(matches!(
-            store.get_execution(&running.id),
+            store.get_execution(&running.id).await,
             Err(Error::ExecutionNotFound(_))
         ));
     }

@@ -1,3 +1,25 @@
+## 2026-07 구현 검증: substrate의 최소 신뢰 경계
+
+v0.2에서는 최초 prototype의 핵심 약점을 먼저 닫았다.
+
+- command마다 private supervisor가 process group을 소유한다. daemon이
+  `SIGKILL`되어 control pipe가 닫히면 supervisor가 TERM/KILL 순서로 명령을
+  종료하고, 재시작한 daemon은 record를 `interrupted`로 확정한다.
+- graceful shutdown은 새 실행을 거부하고 queued record를 취소한 뒤 running
+  supervisor와 SQLite flush barrier를 기다린다.
+- protocol v2의 cursor subscription은 durable replay 뒤 live event를 push한다.
+  연결을 끊고 같은 cursor로 다시 붙는 통합 테스트에서 sequence 누락과 중복이
+  없음을 확인했다.
+- SQLite는 Tokio worker가 아니라 전용 storage actor thread에서 동작한다.
+- 실제 Codex가 project-scoped MCP를 통해 stdout/stderr와 exit code 7을 읽고,
+  장기 실행을 cancel한 뒤 terminal state까지 재조회하는 smoke test를 통과했다.
+
+따라서 다음 제품 질문은 더 이상 "structured execution이 가능한가"가 아니다.
+현재 증명된 것은 trusted local agent용 non-interactive execution substrate다.
+다음 단계는 실제 사용 로그를 바탕으로 PTY/input-required/human handoff 중 어느
+하나가 가장 먼저 필요한지 결정하는 것이다. workspace scope는 cwd와 record를
+제한하지만 OS sandbox는 아니므로, untrusted agent 격리는 별도 설계 과제다.
+
 ## 2026-07 결정: terminal UI가 아니라 execution substrate부터
 
 Loomterm의 첫 제품 경계는 GUI terminal emulator가 아니다. **외부 coding

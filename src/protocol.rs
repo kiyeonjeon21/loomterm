@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::model::{
-    Execution, ExecutionEvent, ExecutionRequest, Health, PROTOCOL_VERSION, ReadOutputResponse,
-    WaitResponse, Workspace,
+    Execution, ExecutionEvent, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION,
+    ReadOutputResponse, WaitResponse, Workspace,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -93,6 +93,10 @@ pub enum Operation {
         #[serde(default = "default_list_limit")]
         limit: u32,
     },
+    Stats {
+        workspace: String,
+        since_ms: i64,
+    },
     ReadOutput {
         execution_id: String,
         #[serde(default)]
@@ -148,6 +152,7 @@ pub enum ProtocolResult {
     Workspaces(Vec<Workspace>),
     Execution(Execution),
     Executions(Vec<Execution>),
+    Stats(ExecutionStats),
     Output(ReadOutputResponse),
     Wait(WaitResponse),
     Subscription(SubscriptionResponse),

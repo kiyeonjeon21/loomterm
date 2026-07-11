@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -7,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{
     CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
-    ExecutionRequest, ExecutionState, OutputStream, ReadOutputResponse, Workspace, new_id, now_ms,
+    ExecutionRequest, ExecutionState, ExecutionStats, ExecutionStatusCounts, InitiatorStats,
+    OutputStream, ReadOutputResponse, Workspace, new_id, now_ms,
 };
 use crate::{Error, Result};
 
@@ -84,6 +86,12 @@ enum StoreCommand {
         workspace: Option<String>,
         limit: u32,
         reply: oneshot::Sender<Result<Vec<Execution>>>,
+    },
+    ExecutionStats {
+        workspace: String,
+        since_ms: i64,
+        until_ms: i64,
+        reply: oneshot::Sender<Result<ExecutionStats>>,
     },
     ReadOutput {
         id: String,
@@ -279,6 +287,26 @@ impl Store {
         self.request(|reply| StoreCommand::ListExecutions {
             workspace: workspace.map(str::to_owned),
             limit,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn execution_stats(
+        &self,
+        workspace: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<ExecutionStats> {
+        if since_ms > until_ms {
+            return Err(Error::InvalidRequest(
+                "statistics window start must not exceed its end".into(),
+            ));
+        }
+        self.request(|reply| StoreCommand::ExecutionStats {
+            workspace: workspace.to_owned(),
+            since_ms,
+            until_ms,
             reply,
         })
         .await
@@ -704,6 +732,39 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn execution_stats(
+        &self,
+        workspace: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<ExecutionStats> {
+        if since_ms > until_ms {
+            return Err(Error::InvalidRequest(
+                "statistics window start must not exceed its end".into(),
+            ));
+        }
+        let workspace = self.get_workspace(workspace)?;
+        let executions = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT id, workspace_id, state, command_json, cwd, env_keys_json,
+                    initiator_json, created_at_ms, started_at_ms, ended_at_ms, pid, pgid,
+                    outcome_json, captured_bytes, output_truncated, last_seq
+                 FROM executions
+                 WHERE workspace_id = ?1 AND created_at_ms >= ?2 AND created_at_ms <= ?3
+                 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = statement.query_map(
+                params![workspace.id, since_ms, until_ms],
+                execution_from_row,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(build_execution_stats(
+            workspace, executions, since_ms, until_ms,
+        ))
+    }
+
     pub fn read_output(
         &self,
         id: &str,
@@ -875,6 +936,14 @@ fn run_store_actor(database: Database, mut receiver: mpsc::Receiver<StoreCommand
             } => {
                 let _ = reply.send(database.list_executions(workspace.as_deref(), limit));
             }
+            StoreCommand::ExecutionStats {
+                workspace,
+                since_ms,
+                until_ms,
+                reply,
+            } => {
+                let _ = reply.send(database.execution_stats(&workspace, since_ms, until_ms));
+            }
             StoreCommand::ReadOutput {
                 id,
                 after_seq,
@@ -1007,6 +1076,95 @@ fn output_event(
     }
 }
 
+fn build_execution_stats(
+    workspace: Workspace,
+    executions: Vec<Execution>,
+    since_ms: i64,
+    until_ms: i64,
+) -> ExecutionStats {
+    let mut status = ExecutionStatusCounts::default();
+    let mut initiators = BTreeMap::<String, u64>::new();
+    let mut captured_bytes = 0_u64;
+    let mut truncated_executions = 0_u64;
+    let mut durations = Vec::new();
+
+    for execution in &executions {
+        captured_bytes = captured_bytes.saturating_add(execution.captured_bytes);
+        if execution.output_truncated {
+            truncated_executions = truncated_executions.saturating_add(1);
+        }
+        let initiator = initiators
+            .entry(execution.initiator.kind.clone())
+            .or_default();
+        *initiator = initiator.saturating_add(1);
+
+        match (&execution.state, &execution.outcome) {
+            (ExecutionState::Queued, _) => status.queued = status.queued.saturating_add(1),
+            (ExecutionState::Running, _) => status.running = status.running.saturating_add(1),
+            (ExecutionState::Cancelled, _) => status.cancelled = status.cancelled.saturating_add(1),
+            (ExecutionState::Interrupted, _) => {
+                status.interrupted = status.interrupted.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::Exited { code: 0 })) => {
+                status.exited_zero = status.exited_zero.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::Exited { .. })) => {
+                status.exited_nonzero = status.exited_nonzero.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::Signaled { .. })) => {
+                status.signaled = status.signaled.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::SpawnError { .. })) => {
+                status.spawn_error = status.spawn_error.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::Cancelled { .. })) => {
+                status.cancelled = status.cancelled.saturating_add(1)
+            }
+            (ExecutionState::Finished, Some(ExecutionOutcome::Interrupted { .. })) => {
+                status.interrupted = status.interrupted.saturating_add(1)
+            }
+            (ExecutionState::Finished, None) => {
+                status.unknown_terminal = status.unknown_terminal.saturating_add(1)
+            }
+        }
+
+        if execution.state.is_terminal()
+            && let (Some(started), Some(ended)) = (execution.started_at_ms, execution.ended_at_ms)
+        {
+            durations.push(ended.saturating_sub(started).max(0) as u64);
+        }
+    }
+
+    durations.sort_unstable();
+    ExecutionStats {
+        workspace,
+        since_ms,
+        until_ms,
+        total: executions.len() as u64,
+        status,
+        by_initiator: initiators
+            .into_iter()
+            .map(|(kind, count)| InitiatorStats { kind, count })
+            .collect(),
+        captured_bytes,
+        truncated_executions,
+        duration_samples: durations.len() as u64,
+        duration_p50_ms: nearest_rank(&durations, 50),
+        duration_p95_ms: nearest_rank(&durations, 95),
+    }
+}
+
+fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = percentile
+        .saturating_mul(sorted.len())
+        .div_ceil(100)
+        .clamp(1, sorted.len());
+    sorted.get(rank - 1).copied()
+}
+
 fn event_from_row(
     id: &str,
     row: &Row<'_>,
@@ -1098,6 +1256,54 @@ mod tests {
         }
     }
 
+    fn workspace() -> Workspace {
+        Workspace {
+            id: "workspace-id".into(),
+            name: "test".into(),
+            root: "/tmp/test".into(),
+            created_at_ms: 1,
+        }
+    }
+
+    fn execution(
+        id: &str,
+        state: ExecutionState,
+        outcome: Option<ExecutionOutcome>,
+        initiator: &str,
+        duration_ms: Option<u64>,
+    ) -> Execution {
+        let (started_at_ms, ended_at_ms) = duration_ms
+            .map(|duration| (Some(1_000), Some(1_000 + duration as i64)))
+            .unwrap_or((None, None));
+        Execution {
+            id: id.into(),
+            workspace_id: "workspace-id".into(),
+            state,
+            command: CommandSpec::Argv {
+                program: "true".into(),
+                args: Vec::new(),
+            },
+            command_display: "true".into(),
+            cwd: "/tmp/test".into(),
+            env_keys: Vec::new(),
+            initiator: Initiator {
+                kind: initiator.into(),
+                name: None,
+                session_id: None,
+            },
+            created_at_ms: 1_000,
+            started_at_ms,
+            ended_at_ms,
+            duration_ms,
+            pid: None,
+            pgid: None,
+            outcome,
+            captured_bytes: 10,
+            output_truncated: id == "spawn-error",
+            last_seq: 0,
+        }
+    }
+
     #[tokio::test]
     async fn stores_execution_and_lossless_output() {
         let store = Store::in_memory().unwrap();
@@ -1156,6 +1362,156 @@ mod tests {
         assert!(matches!(
             store.get_execution(&running.id).await,
             Err(Error::ExecutionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn builds_empty_execution_stats() {
+        let stats = build_execution_stats(workspace(), Vec::new(), 100, 200);
+
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.status, ExecutionStatusCounts::default());
+        assert!(stats.by_initiator.is_empty());
+        assert_eq!(stats.duration_p50_ms, None);
+        assert_eq!(stats.duration_p95_ms, None);
+    }
+
+    #[test]
+    fn classifies_every_execution_and_sorts_initiators() {
+        let executions = vec![
+            execution("queued", ExecutionState::Queued, None, "mcp", None),
+            execution("running", ExecutionState::Running, None, "cli", None),
+            execution(
+                "success",
+                ExecutionState::Finished,
+                Some(ExecutionOutcome::Exited { code: 0 }),
+                "mcp",
+                Some(10),
+            ),
+            execution(
+                "failure",
+                ExecutionState::Finished,
+                Some(ExecutionOutcome::Exited { code: 2 }),
+                "cli",
+                Some(20),
+            ),
+            execution(
+                "signaled",
+                ExecutionState::Finished,
+                Some(ExecutionOutcome::Signaled { signal: 9 }),
+                "cli",
+                Some(30),
+            ),
+            execution(
+                "spawn-error",
+                ExecutionState::Finished,
+                Some(ExecutionOutcome::SpawnError {
+                    message: "missing".into(),
+                }),
+                "cli",
+                Some(40),
+            ),
+            execution(
+                "cancelled",
+                ExecutionState::Cancelled,
+                Some(ExecutionOutcome::Cancelled { signal: Some(15) }),
+                "cli",
+                Some(50),
+            ),
+            execution(
+                "interrupted",
+                ExecutionState::Interrupted,
+                Some(ExecutionOutcome::Interrupted {
+                    reason: "restart".into(),
+                }),
+                "cli",
+                Some(60),
+            ),
+            execution("unknown", ExecutionState::Finished, None, "cli", Some(70)),
+        ];
+
+        let stats = build_execution_stats(workspace(), executions, 100, 200);
+
+        assert_eq!(stats.total, 9);
+        assert_eq!(stats.status.queued, 1);
+        assert_eq!(stats.status.running, 1);
+        assert_eq!(stats.status.exited_zero, 1);
+        assert_eq!(stats.status.exited_nonzero, 1);
+        assert_eq!(stats.status.signaled, 1);
+        assert_eq!(stats.status.spawn_error, 1);
+        assert_eq!(stats.status.cancelled, 1);
+        assert_eq!(stats.status.interrupted, 1);
+        assert_eq!(stats.status.unknown_terminal, 1);
+        assert_eq!(
+            stats.by_initiator,
+            vec![
+                InitiatorStats {
+                    kind: "cli".into(),
+                    count: 7,
+                },
+                InitiatorStats {
+                    kind: "mcp".into(),
+                    count: 2,
+                },
+            ]
+        );
+        assert_eq!(stats.captured_bytes, 90);
+        assert_eq!(stats.truncated_executions, 1);
+        assert_eq!(stats.duration_samples, 7);
+        assert_eq!(stats.duration_p50_ms, Some(40));
+        assert_eq!(stats.duration_p95_ms, Some(70));
+    }
+
+    #[test]
+    fn nearest_rank_handles_boundaries() {
+        assert_eq!(nearest_rank(&[], 50), None);
+        assert_eq!(nearest_rank(&[7], 50), Some(7));
+        assert_eq!(nearest_rank(&[10, 20], 50), Some(10));
+        assert_eq!(nearest_rank(&[10, 20], 95), Some(20));
+        assert_eq!(nearest_rank(&[10, 20, 30, 40], 50), Some(20));
+    }
+
+    #[test]
+    fn database_stats_filter_by_workspace_and_window() {
+        let database = Database::open(StoreLocation::Memory).unwrap();
+        let first_root = tempdir().unwrap();
+        let second_root = tempdir().unwrap();
+        let first = database.add_workspace("first", first_root.path()).unwrap();
+        let second = database
+            .add_workspace("second", second_root.path())
+            .unwrap();
+        let first_execution = database
+            .create_execution(&request(first.id.clone()), first_root.path())
+            .unwrap();
+        let second_execution = database
+            .create_execution(&request(second.id), second_root.path())
+            .unwrap();
+        database
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE executions
+                 SET created_at_ms = CASE id WHEN ?1 THEN 100 WHEN ?2 THEN 200 ELSE created_at_ms END
+                 WHERE id IN (?1, ?2)",
+                params![first_execution.id, second_execution.id],
+            )
+            .unwrap();
+
+        let stats = database.execution_stats(&first.id, 50, 150).unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.workspace.id, first.id);
+        assert_eq!(
+            database.execution_stats("first", 101, 300).unwrap().total,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_reversed_stats_window() {
+        let store = Store::in_memory().unwrap();
+        assert!(matches!(
+            store.execution_stats("test", 200, 100).await,
+            Err(Error::InvalidRequest(_))
         ));
     }
 }

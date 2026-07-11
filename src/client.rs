@@ -10,8 +10,8 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::AppPaths;
 use crate::model::{
-    Execution, ExecutionRequest, Health, PROTOCOL_VERSION, ReadOutputResponse, WaitResponse,
-    Workspace,
+    Execution, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse,
+    WaitResponse, Workspace,
 };
 use crate::protocol::{
     MAX_FRAME_BYTES, Operation, ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
@@ -105,6 +105,19 @@ impl DaemonClient {
         match self.call(Operation::List { workspace, limit }).await? {
             ProtocolResult::Executions(value) => Ok(value),
             value => unexpected("executions", value),
+        }
+    }
+
+    pub async fn stats(&self, workspace: String, since_ms: i64) -> Result<ExecutionStats> {
+        match self
+            .call(Operation::Stats {
+                workspace,
+                since_ms,
+            })
+            .await?
+        {
+            ProtocolResult::Stats(value) => Ok(value),
+            value => unexpected("statistics", value),
         }
     }
 

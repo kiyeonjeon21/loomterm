@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine;
 use loomterm::client::DaemonClient;
 use loomterm::config::{AppPaths, Settings};
 use loomterm::executor::ExecutionEngine;
@@ -9,6 +11,8 @@ use loomterm::model::{
     Initiator, OutputStream,
 };
 use loomterm::store::Store;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use tempfile::TempDir;
 
 fn settings() -> Settings {
@@ -19,6 +23,9 @@ fn settings() -> Settings {
         retention_bytes: 1024 * 1024,
         cancel_grace_ms: 25,
         shell: "/bin/sh".into(),
+        supervisor_path: Some(std::path::PathBuf::from(env!(
+            "CARGO_BIN_EXE_loom-supervisor"
+        ))),
     }
 }
 
@@ -56,7 +63,7 @@ async fn wait_terminal(engine: &ExecutionEngine, id: &str) -> loomterm::model::E
 async fn captures_streams_and_nonzero_exit_without_screen_scraping() {
     let temp = TempDir::new().unwrap();
     let store = Store::open(&temp.path().join("loom.db")).unwrap();
-    let workspace = store.add_workspace("test", temp.path()).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
     let engine = ExecutionEngine::new(store.clone(), settings());
     let execution = engine
         .execute(request(
@@ -74,11 +81,21 @@ async fn captures_streams_and_nonzero_exit_without_screen_scraping() {
         final_execution.outcome,
         Some(ExecutionOutcome::Exited { code: 7 })
     );
-    let output = store.read_output(&execution.id, 0, 1024).unwrap();
+    let output = store.read_output(&execution.id, 0, 1024).await.unwrap();
     let mut stdout = String::new();
     let mut stderr = String::new();
     for event in output.events {
-        if let ExecutionEventPayload::Output { stream, text, .. } = event.payload {
+        if let ExecutionEventPayload::Output {
+            stream,
+            data_base64,
+        } = event.payload
+        {
+            let text = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data_base64)
+                    .unwrap(),
+            )
+            .unwrap();
             match stream {
                 OutputStream::Stdout => stdout.push_str(&text),
                 OutputStream::Stderr => stderr.push_str(&text),
@@ -97,7 +114,7 @@ async fn enforces_workspace_boundary_and_capture_limit() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
     let store = Store::open(&parent.path().join("loom.db")).unwrap();
-    let workspace = store.add_workspace("test", &root).unwrap();
+    let workspace = store.add_workspace("test", &root).await.unwrap();
     let engine = ExecutionEngine::new(store.clone(), settings());
 
     let mut escaped = request(
@@ -128,6 +145,7 @@ async fn enforces_workspace_boundary_and_capture_limit() {
     assert!(
         store
             .read_output(&execution.id, 0, 1024)
+            .await
             .unwrap()
             .events
             .iter()
@@ -142,7 +160,7 @@ async fn enforces_workspace_boundary_and_capture_limit() {
 async fn cancels_the_running_process_group() {
     let temp = TempDir::new().unwrap();
     let store = Store::open(&temp.path().join("loom.db")).unwrap();
-    let workspace = store.add_workspace("test", temp.path()).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
     let engine = ExecutionEngine::new(store, settings());
     let execution = engine
         .execute(request(
@@ -156,7 +174,7 @@ async fn cancels_the_running_process_group() {
         .unwrap();
 
     loop {
-        let current = engine.store().get_execution(&execution.id).unwrap();
+        let current = engine.store().get_execution(&execution.id).await.unwrap();
         if current.state == ExecutionState::Running {
             break;
         }
@@ -234,7 +252,12 @@ async fn daemon_keeps_execution_across_client_connections() {
         .await
         .unwrap();
     assert!(output.events.iter().any(|event| {
-        matches!(&event.payload, ExecutionEventPayload::Output { text, .. } if text == "reconnected")
+        let ExecutionEventPayload::Output { data_base64, .. } = &event.payload else {
+            return false;
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .is_ok_and(|data| data == b"reconnected")
     }));
 
     second_client.shutdown().await.unwrap();
@@ -249,7 +272,7 @@ async fn daemon_keeps_execution_across_client_connections() {
 async fn batches_concurrent_high_volume_output_without_loss() {
     let temp = TempDir::new().unwrap();
     let store = Store::open(&temp.path().join("loom.db")).unwrap();
-    let workspace = store.add_workspace("test", temp.path()).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
     let engine = ExecutionEngine::new(store, settings());
     let command = "i=0; while [ $i -lt 5000 ]; do printf 0123456789abcdef; i=$((i+1)); done";
     let first = engine
@@ -287,7 +310,7 @@ async fn batches_concurrent_high_volume_output_without_loss() {
 async fn queued_execution_can_be_cancelled_before_spawn() {
     let temp = TempDir::new().unwrap();
     let store = Store::open(&temp.path().join("loom.db")).unwrap();
-    let workspace = store.add_workspace("test", temp.path()).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
     let mut single_slot = settings();
     single_slot.max_concurrent_executions = 1;
     let engine = ExecutionEngine::new(store, single_slot);
@@ -302,7 +325,14 @@ async fn queued_execution_can_be_cancelled_before_spawn() {
         .await
         .unwrap();
     loop {
-        if engine.store().get_execution(&blocker.id).unwrap().state == ExecutionState::Running {
+        if engine
+            .store()
+            .get_execution(&blocker.id)
+            .await
+            .unwrap()
+            .state
+            == ExecutionState::Running
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -322,4 +352,270 @@ async fn queued_execution_can_be_cancelled_before_spawn() {
     assert_eq!(cancelled.state, ExecutionState::Cancelled);
     engine.cancel(&blocker.id).await.unwrap();
     let _ = wait_terminal(&engine, &blocker.id).await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_cancels_queued_work_without_spawning_it() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let mut single_slot = settings();
+    single_slot.max_concurrent_executions = 1;
+    let daemon_paths = paths.clone();
+    let daemon =
+        tokio::spawn(async move { loomterm::daemon::run(daemon_paths, single_slot).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let blocker = client
+        .execute(request(
+            workspace.id.clone(),
+            CommandSpec::Argv {
+                program: "/bin/sleep".into(),
+                args: vec!["30".into()],
+            },
+        ))
+        .await
+        .unwrap();
+    wait_running(&client, &blocker.id).await;
+
+    let marker = temp.path().join("queued-command-ran");
+    let queued = client
+        .execute(request(
+            workspace.id,
+            CommandSpec::Argv {
+                program: "/usr/bin/touch".into(),
+                args: vec![marker.to_string_lossy().into_owned()],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ExecutionState::Queued);
+
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!marker.exists());
+
+    let store = Store::open(&paths.database).unwrap();
+    assert_eq!(
+        store.get_execution(&queued.id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    assert_eq!(
+        store.get_execution(&blocker.id).await.unwrap().state,
+        ExecutionState::Cancelled
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_reconnect_replays_exactly_after_the_cursor() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let daemon_paths = paths.clone();
+    let daemon = tokio::spawn(async move { loomterm::daemon::run(daemon_paths, settings()).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let execution = client
+        .execute(request(
+            workspace.id,
+            CommandSpec::Shell {
+                command: "printf one; sleep 0.05; printf two; sleep 0.05; printf three".into(),
+                shell: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let mut first = client.subscribe(execution.id.clone(), 0).await.unwrap();
+    let first_event = tokio::time::timeout(Duration::from_secs(2), first.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut sequences = vec![first_event.seq];
+    let cursor = first_event.seq;
+    drop(first);
+
+    let mut resumed = client
+        .subscribe(execution.id.clone(), cursor)
+        .await
+        .unwrap();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(2), resumed.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        sequences.push(event.seq);
+    }
+    let final_execution = client.get(execution.id).await.unwrap();
+    assert!(final_execution.state.is_terminal());
+    assert_eq!(sequences.first(), Some(&1));
+    assert_eq!(sequences.last(), Some(&final_execution.last_seq));
+    assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn daemon_sigkill_causes_supervisor_to_terminate_the_command_group() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+    std::fs::write(&paths.config_file, "cancel_grace_ms = 25\n").unwrap();
+    let mut daemon = spawn_daemon_process(&paths);
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let execution = client
+        .execute(request(
+            workspace.id,
+            CommandSpec::Shell {
+                command: "sleep 30 & wait".into(),
+                shell: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let running = wait_running(&client, &execution.id).await;
+    let command_pid = running.pid.unwrap() as i32;
+
+    daemon.start_kill().unwrap();
+    daemon.wait().await.unwrap();
+    let gone = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match kill(Pid::from_raw(command_pid), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "command process survived the daemon crash");
+
+    let mut restarted = spawn_daemon_process(&paths);
+    let restarted_client = wait_for_daemon(&paths).await;
+    assert_eq!(
+        restarted_client.get(execution.id).await.unwrap().state,
+        ExecutionState::Interrupted
+    );
+    restarted_client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), restarted.wait())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn daemon_queries_remain_responsive_during_high_volume_capture() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let daemon_paths = paths.clone();
+    let daemon = tokio::spawn(async move { loomterm::daemon::run(daemon_paths, settings()).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let execution = client
+        .execute(request(
+            workspace.id.clone(),
+            CommandSpec::Shell {
+                command:
+                    "i=0; while [ $i -lt 100000 ]; do printf 0123456789abcdef; i=$((i+1)); done"
+                        .into(),
+                shell: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        let listed = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.list(Some(workspace.id.clone()), 10),
+        )
+        .await
+        .expect("storage query blocked the async daemon")
+        .unwrap();
+        assert!(listed.iter().any(|item| item.id == execution.id));
+    }
+    let mut cursor = 0;
+    loop {
+        let response = client
+            .wait(execution.id.clone(), cursor, 5_000, 1024 * 1024)
+            .await
+            .unwrap();
+        cursor = response.next_seq;
+        if response.execution.state.is_terminal() {
+            break;
+        }
+    }
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+fn test_paths(temp: &TempDir) -> AppPaths {
+    AppPaths {
+        state_dir: temp.path().join("state"),
+        runtime_dir: temp.path().join("run"),
+        config_file: temp.path().join("config/config.toml"),
+        database: temp.path().join("state/loom.db"),
+        socket: temp.path().join("run/loomd.sock"),
+        lock_file: temp.path().join("run/loomd.lock"),
+    }
+}
+
+async fn wait_for_daemon(paths: &AppPaths) -> DaemonClient {
+    let client = DaemonClient::new(&paths.socket);
+    for _ in 0..300 {
+        if client.health().await.is_ok() {
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("daemon did not become ready at {}", paths.socket.display());
+}
+
+async fn wait_running(client: &DaemonClient, id: &str) -> loomterm::model::Execution {
+    for _ in 0..300 {
+        let execution = client.get(id.to_owned()).await.unwrap();
+        if execution.state == ExecutionState::Running {
+            return execution;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("execution did not enter running state: {id}");
+}
+
+fn spawn_daemon_process(paths: &AppPaths) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_loomd"));
+    command
+        .env("LOOMTERM_STATE_DIR", &paths.state_dir)
+        .env("LOOMTERM_RUNTIME_DIR", &paths.runtime_dir)
+        .env("LOOMTERM_CONFIG", &paths.config_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command.spawn().unwrap()
 }

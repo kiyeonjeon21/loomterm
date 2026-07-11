@@ -14,7 +14,7 @@ use crate::model::{
     Workspace,
 };
 use crate::protocol::{
-    MAX_FRAME_BYTES, Operation, ProtocolRequest, ProtocolResponse, ProtocolResult, ResponseBody,
+    MAX_FRAME_BYTES, Operation, ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
 };
 use crate::{Error, Result};
 
@@ -46,35 +46,29 @@ impl DaemonClient {
     }
 
     pub async fn call(&self, operation: Operation) -> Result<ProtocolResult> {
-        let stream = UnixStream::connect(&self.socket)
-            .await
-            .map_err(|_| Error::DaemonUnavailable(self.socket.clone()))?;
-        let codec = LengthDelimitedCodec::builder()
-            .max_frame_length(MAX_FRAME_BYTES)
-            .new_codec();
-        let mut framed = Framed::new(stream, codec);
-        let request = ProtocolRequest::new(operation);
-        let request_id = request.request_id.clone();
+        let mut framed = self.connect().await?;
+        let request = WireMessage::request(operation);
+        let request_id = match &request {
+            WireMessage::Request { request_id, .. } => request_id.clone(),
+            _ => unreachable!(),
+        };
         let body = serde_json::to_vec(&request)?;
         framed.send(Bytes::from(body)).await?;
         let frame = framed
             .next()
             .await
             .ok_or_else(|| Error::Protocol("daemon closed the connection".into()))??;
-        let response: ProtocolResponse = serde_json::from_slice(&frame)?;
-        if response.version != PROTOCOL_VERSION {
-            return Err(Error::Protocol(format!(
-                "unsupported daemon protocol version {}",
-                response.version
-            )));
-        }
-        if response.request_id != request_id {
-            return Err(Error::Protocol("response request_id did not match".into()));
-        }
-        match response.body {
-            ResponseBody::Ok { result } => Ok(*result),
-            ResponseBody::Error { error } => Err(error.into_error()),
-        }
+        decode_response(&frame, &request_id)
+    }
+
+    async fn connect(&self) -> Result<Framed<UnixStream, LengthDelimitedCodec>> {
+        let stream = UnixStream::connect(&self.socket)
+            .await
+            .map_err(|_| Error::DaemonUnavailable(self.socket.clone()))?;
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_BYTES)
+            .new_codec();
+        Ok(Framed::new(stream, codec))
     }
 
     pub async fn health(&self) -> Result<Health> {
@@ -154,6 +148,43 @@ impl DaemonClient {
         }
     }
 
+    pub async fn subscribe(
+        &self,
+        execution_id: String,
+        after_seq: u64,
+    ) -> Result<ExecutionSubscription> {
+        let mut framed = self.connect().await?;
+        let request = WireMessage::request(Operation::Subscribe {
+            execution_id,
+            after_seq,
+        });
+        let request_id = match &request {
+            WireMessage::Request { request_id, .. } => request_id.clone(),
+            _ => unreachable!(),
+        };
+        framed
+            .send(Bytes::from(serde_json::to_vec(&request)?))
+            .await?;
+        let frame = framed
+            .next()
+            .await
+            .ok_or_else(|| Error::Protocol("daemon closed the subscription".into()))??;
+        let response = decode_response(&frame, &request_id)?;
+        let ProtocolResult::Subscription(SubscriptionResponse {
+            execution,
+            next_seq,
+        }) = response
+        else {
+            return unexpected("subscription", response);
+        };
+        Ok(ExecutionSubscription {
+            framed,
+            subscription_id: request_id,
+            execution,
+            next_seq,
+        })
+    }
+
     pub async fn cancel(&self, execution_id: String) -> Result<Execution> {
         expect_execution(self.call(Operation::Cancel { execution_id }).await?)
     }
@@ -163,6 +194,75 @@ impl DaemonClient {
             ProtocolResult::Empty => Ok(()),
             value => unexpected("empty response", value),
         }
+    }
+}
+
+pub struct ExecutionSubscription {
+    framed: Framed<UnixStream, LengthDelimitedCodec>,
+    subscription_id: String,
+    pub execution: Execution,
+    pub next_seq: u64,
+}
+
+impl ExecutionSubscription {
+    pub async fn next_event(&mut self) -> Result<Option<crate::model::ExecutionEvent>> {
+        let Some(frame) = self.framed.next().await else {
+            return Ok(None);
+        };
+        let message: WireMessage = serde_json::from_slice(&frame?)?;
+        match message {
+            WireMessage::Event {
+                version,
+                subscription_id,
+                event,
+            } => {
+                if version != PROTOCOL_VERSION {
+                    return Err(Error::Protocol(format!(
+                        "unsupported daemon protocol version {version}"
+                    )));
+                }
+                if subscription_id != self.subscription_id {
+                    return Err(Error::Protocol(
+                        "subscription event id did not match".into(),
+                    ));
+                }
+                if event.seq != self.next_seq + 1 {
+                    return Err(Error::Protocol(format!(
+                        "subscription sequence was not contiguous after {}: received {}",
+                        self.next_seq, event.seq
+                    )));
+                }
+                self.next_seq = event.seq;
+                Ok(Some(event))
+            }
+            _ => Err(Error::Protocol(
+                "expected subscription event from daemon".into(),
+            )),
+        }
+    }
+}
+
+fn decode_response(frame: &[u8], expected_request_id: &str) -> Result<ProtocolResult> {
+    let response: WireMessage = serde_json::from_slice(frame)?;
+    let WireMessage::Response {
+        version,
+        request_id,
+        body,
+    } = response
+    else {
+        return Err(Error::Protocol("expected daemon response".into()));
+    };
+    if version != PROTOCOL_VERSION {
+        return Err(Error::Protocol(format!(
+            "unsupported daemon protocol version {version}"
+        )));
+    }
+    if request_id != expected_request_id {
+        return Err(Error::Protocol("response request_id did not match".into()));
+    }
+    match body {
+        ResponseBody::Ok { result } => Ok(*result),
+        ResponseBody::Error { error } => Err(error.into_error()),
     }
 }
 

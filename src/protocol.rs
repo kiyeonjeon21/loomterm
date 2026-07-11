@@ -3,26 +3,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::model::{
-    Execution, ExecutionRequest, Health, PROTOCOL_VERSION, ReadOutputResponse, WaitResponse,
-    Workspace,
+    Execution, ExecutionEvent, ExecutionRequest, Health, PROTOCOL_VERSION, ReadOutputResponse,
+    WaitResponse, Workspace,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtocolRequest {
-    pub version: u32,
-    pub request_id: String,
-    #[serde(flatten)]
-    pub operation: Operation,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireMessage {
+    Request {
+        version: u32,
+        request_id: String,
+        #[serde(flatten)]
+        operation: Operation,
+    },
+    Response {
+        version: u32,
+        request_id: String,
+        #[serde(flatten)]
+        body: ResponseBody,
+    },
+    Event {
+        version: u32,
+        subscription_id: String,
+        event: ExecutionEvent,
+    },
 }
 
-impl ProtocolRequest {
-    pub fn new(operation: Operation) -> Self {
-        Self {
+impl WireMessage {
+    pub fn request(operation: Operation) -> Self {
+        Self::Request {
             version: PROTOCOL_VERSION,
             request_id: crate::model::new_id(),
             operation,
+        }
+    }
+
+    pub fn ok(request_id: String, result: ProtocolResult) -> Self {
+        Self::Response {
+            version: PROTOCOL_VERSION,
+            request_id,
+            body: ResponseBody::Ok {
+                result: Box::new(result),
+            },
+        }
+    }
+
+    pub fn error(request_id: String, error: &Error) -> Self {
+        Self::Response {
+            version: PROTOCOL_VERSION,
+            request_id,
+            body: ResponseBody::Error {
+                error: ProtocolError::from(error),
+            },
+        }
+    }
+
+    pub fn event(subscription_id: String, event: ExecutionEvent) -> Self {
+        Self::Event {
+            version: PROTOCOL_VERSION,
+            subscription_id,
+            event,
         }
     }
 }
@@ -67,6 +109,11 @@ pub enum Operation {
         #[serde(default = "default_read_bytes")]
         max_bytes: usize,
     },
+    Subscribe {
+        execution_id: String,
+        #[serde(default)]
+        after_seq: u64,
+    },
     Cancel {
         execution_id: String,
     },
@@ -83,36 +130,6 @@ pub fn default_read_bytes() -> usize {
 
 pub fn default_wait_ms() -> u64 {
     30_000
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProtocolResponse {
-    pub version: u32,
-    pub request_id: String,
-    #[serde(flatten)]
-    pub body: ResponseBody,
-}
-
-impl ProtocolResponse {
-    pub fn ok(request_id: String, result: ProtocolResult) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id,
-            body: ResponseBody::Ok {
-                result: Box::new(result),
-            },
-        }
-    }
-
-    pub fn error(request_id: String, error: &Error) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id,
-            body: ResponseBody::Error {
-                error: ProtocolError::from(error),
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +150,13 @@ pub enum ProtocolResult {
     Executions(Vec<Execution>),
     Output(ReadOutputResponse),
     Wait(WaitResponse),
+    Subscription(SubscriptionResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionResponse {
+    pub execution: Execution,
+    pub next_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,8 +180,10 @@ impl From<&Error> for ProtocolError {
             Error::InvalidRequest(_) => "invalid_request",
             Error::AlreadyTerminal(_) => "already_terminal",
             Error::PermissionDenied(_) => "permission_denied",
+            Error::DaemonDraining => "daemon_draining",
             Error::Timeout => "timeout",
             Error::Config(_) => "configuration_error",
+            Error::StorageUnavailable(_) => "storage_unavailable",
             Error::Io(_)
             | Error::Database(_)
             | Error::Json(_)

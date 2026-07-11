@@ -77,6 +77,7 @@ pub struct Settings {
     pub retention_bytes: u64,
     pub cancel_grace_ms: u64,
     pub shell: String,
+    pub supervisor_path: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -88,6 +89,7 @@ impl Default for Settings {
             retention_bytes: 1024 * 1024 * 1024,
             cancel_grace_ms: 2_000,
             shell: "/bin/sh".into(),
+            supervisor_path: None,
         }
     }
 }

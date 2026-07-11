@@ -66,7 +66,9 @@ database; nothing is sent to an external service.
 
 ## Focused run: 2026-07-12
 
-The session started from zero execution records and covered discovery,
+This automated probe spanned about 2 minutes 31 seconds, so it did not satisfy
+the 30-45 minute real-work protocol above. It started from zero execution
+records and covered discovery,
 dependency metadata, formatting, linting, tests, release builds, version
 control, direct argv, explicit shell, non-zero outcomes, cancellation, and
 cursor-based reconnects.
@@ -96,7 +98,7 @@ the terminal `cancelled` state and was available through `loom_wait` or
 | Interactive probe | A shell `read` received EOF and exited 1 without a PTY | Use non-interactive flags or initial stdin | Known capability gap, but no real task was blocked |
 | Initial activation | Use still depends on a source build, workspace registration, and project MCP configuration | Follow the repository setup steps | Packaging and onboarding are now the largest observed product gap |
 
-No output loss, duplication, orphan process, truncation, or real interactive
-blocker was observed. The decision gates therefore select
-**packaging, installation, and onboarding** as the next product slice. PTY and
-sandbox work remain deferred until real usage supplies a blocker.
+No output loss, duplication, orphan process, truncation, or interactive blocker
+appeared in the probe. This makes **packaging, installation, and onboarding** the
+leading hypothesis, not a final product decision. PTY and sandbox priority still
+requires a real focused session rather than controlled coverage alone.

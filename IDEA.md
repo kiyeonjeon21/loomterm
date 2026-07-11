@@ -1,9 +1,9 @@
-## 2026-07 집중 dogfood 결정: 다음은 packaging/onboarding
+## 2026-07 자동 probe의 잠정 가설: packaging/onboarding
 
-기본 로컬 DB가 비어 있는 상태에서 30~45분 집중 평가를 수행했다. CLI 10건과
-실제 Codex MCP 5건, 총 15건이 discovery, metadata, fmt/clippy, 전체 테스트,
-release build, git 확인, shell pipeline, non-zero, cancel, cursor reconnect를
-포괄했다.
+기본 로컬 DB가 비어 있는 상태에서 약 2분 31초의 자동 probe를 수행했다. CLI
+10건과 실제 Codex MCP 5건, 총 15건이 discovery, metadata, fmt/clippy, 전체
+테스트, release build, git 확인, shell pipeline, non-zero, cancel, cursor
+reconnect를 포괄했다. 이는 30~45분 실제 작업 세션을 대체하지 않는다.
 
 - `exited_zero` 11건, 의도한 non-zero 2건, cancel 2건이 모두 정확한 terminal
   outcome으로 남았다.
@@ -17,11 +17,11 @@ release build, git 확인, shell pipeline, non-zero, cancel, cursor reconnect를
 - 실제 사용을 시작하려면 source build, workspace 등록, project MCP 설정이
   필요했다. 안정적인 execution substrate 이후 가장 큰 마찰은 활성화 과정이다.
 
-따라서 다음 제품 slice는 PTY가 아니라 **versioned binary 배포, 설치 경로,
-workspace/MCP bootstrap을 묶은 packaging/onboarding**이다. PTY/input-required/
-human handoff는 실제 interactive blocker가 관찰될 때, sandbox는 trusted local
-경계를 넘어서는 구체적인 격리 요구가 생길 때 다시 우선순위를 평가한다. 상세
-측정값과 판정 기준은 `DOGFOOD.md`에 보존한다.
+현재 선두 가설은 **versioned binary 배포, 설치 경로, workspace/MCP bootstrap을
+묶은 packaging/onboarding**이다. 다만 PTY/input-required/human handoff와
+sandbox의 우선순위를 배제하는 최종 결정은 아니다. runtime-contract와 storage
+onboarding 문제를 먼저 닫고, 실제 작업 세션에서 다시 판정한다. 상세 측정값과
+판정 기준은 `DOGFOOD.md`에 보존한다.
 
 ## 2026-07 구현 검증: substrate의 최소 신뢰 경계
 

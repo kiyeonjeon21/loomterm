@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -13,7 +12,7 @@ use crate::model::{
 };
 use crate::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const STORE_QUEUE_DEPTH: usize = 512;
 
 #[derive(Debug)]
@@ -407,7 +406,8 @@ impl Database {
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,
                     root TEXT NOT NULL UNIQUE,
-                    created_at_ms INTEGER NOT NULL
+                    created_at_ms INTEGER NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1
                  );
                  CREATE TABLE executions (
                     id TEXT PRIMARY KEY,
@@ -441,7 +441,14 @@ impl Database {
                     payload_json TEXT,
                     PRIMARY KEY(execution_id, seq)
                  );
-                 PRAGMA user_version = 1;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        } else if version == 1 {
+            connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE workspaces ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+                 PRAGMA user_version = 2;
                  COMMIT;",
             )?;
         }
@@ -461,13 +468,50 @@ impl Database {
                 root.display()
             )));
         }
+        let root = root.to_string_lossy().into_owned();
+        let connection = self.connection()?;
+        let existing_root = connection
+            .query_row(
+                "SELECT id, name, root, created_at_ms, active FROM workspaces WHERE root = ?1",
+                [&root],
+                workspace_with_active_from_row,
+            )
+            .optional()?;
+        if let Some((workspace, active)) = existing_root {
+            if workspace.name != name {
+                return Err(Error::InvalidRequest(format!(
+                    "workspace root {} is already registered as {}",
+                    workspace.root, workspace.name
+                )));
+            }
+            if !active {
+                connection.execute(
+                    "UPDATE workspaces SET active = 1 WHERE id = ?1",
+                    [&workspace.id],
+                )?;
+            }
+            return Ok(workspace);
+        }
+        if let Some(workspace) = connection
+            .query_row(
+                "SELECT id, name, root, created_at_ms FROM workspaces WHERE name = ?1",
+                [name],
+                workspace_from_row,
+            )
+            .optional()?
+        {
+            return Err(Error::InvalidRequest(format!(
+                "workspace name {name} is already registered for {}",
+                workspace.root
+            )));
+        }
         let workspace = Workspace {
             id: new_id(),
             name: name.to_owned(),
-            root: root.to_string_lossy().into_owned(),
+            root,
             created_at_ms: now_ms(),
         };
-        self.connection()?.execute(
+        connection.execute(
             "INSERT INTO workspaces(id, name, root, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
             params![
                 workspace.id,
@@ -480,13 +524,18 @@ impl Database {
     }
 
     pub fn remove_workspace(&self, identifier: &str) -> Result<()> {
-        let changed = self.connection()?.execute(
-            "DELETE FROM workspaces WHERE id = ?1 OR name = ?1",
-            [identifier],
-        )?;
-        if changed == 0 {
+        let connection = self.connection()?;
+        let workspace = connection
+            .query_row(
+                "SELECT id FROM workspaces WHERE id = ?1 OR name = ?1",
+                [identifier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = workspace else {
             return Err(Error::WorkspaceNotFound(identifier.into()));
-        }
+        };
+        connection.execute("UPDATE workspaces SET active = 0 WHERE id = ?1", [&id])?;
         Ok(())
     }
 
@@ -494,7 +543,7 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT id, name, root, created_at_ms
-                 FROM workspaces WHERE id = ?1 OR name = ?1",
+                 FROM workspaces WHERE (id = ?1 OR name = ?1) AND active = 1",
                 [identifier],
                 workspace_from_row,
             )
@@ -506,7 +555,8 @@ impl Database {
         let canonical = root.canonicalize()?;
         self.connection()?
             .query_row(
-                "SELECT id, name, root, created_at_ms FROM workspaces WHERE root = ?1",
+                "SELECT id, name, root, created_at_ms
+                 FROM workspaces WHERE root = ?1 AND active = 1",
                 [canonical.to_string_lossy().as_ref()],
                 workspace_from_row,
             )
@@ -517,7 +567,8 @@ impl Database {
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, name, root, created_at_ms FROM workspaces ORDER BY name COLLATE NOCASE",
+            "SELECT id, name, root, created_at_ms FROM workspaces
+             WHERE active = 1 ORDER BY name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], workspace_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -744,25 +795,113 @@ impl Database {
             ));
         }
         let workspace = self.get_workspace(workspace)?;
-        let executions = {
-            let connection = self.connection()?;
-            let mut statement = connection.prepare(
-                "SELECT id, workspace_id, state, command_json, cwd, env_keys_json,
-                    initiator_json, created_at_ms, started_at_ms, ended_at_ms, pid, pgid,
-                    outcome_json, captured_bytes, output_truncated, last_seq
-                 FROM executions
-                 WHERE workspace_id = ?1 AND created_at_ms >= ?2 AND created_at_ms <= ?3
-                 ORDER BY created_at_ms ASC",
-            )?;
-            let rows = statement.query_map(
-                params![workspace.id, since_ms, until_ms],
-                execution_from_row,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        Ok(build_execution_stats(
-            workspace, executions, since_ms, until_ms,
-        ))
+        let connection = self.connection()?;
+        let filter = params![workspace.id, since_ms, until_ms];
+        let (total, status, captured_bytes, truncated_executions) = connection.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(state = 'queued'), 0),
+                COALESCE(SUM(state = 'running'), 0),
+                COALESCE(SUM(state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'exited'
+                    AND json_extract(outcome_json, '$.code') = 0), 0),
+                COALESCE(SUM(state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'exited'
+                    AND json_extract(outcome_json, '$.code') != 0), 0),
+                COALESCE(SUM(state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'signaled'), 0),
+                COALESCE(SUM(state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'spawn_error'), 0),
+                COALESCE(SUM(state = 'cancelled' OR (state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'cancelled')), 0),
+                COALESCE(SUM(state = 'interrupted' OR (state = 'finished'
+                    AND json_extract(outcome_json, '$.kind') = 'interrupted')), 0),
+                COALESCE(SUM(state = 'finished' AND outcome_json IS NULL), 0),
+                COALESCE(SUM(captured_bytes), 0),
+                COALESCE(SUM(output_truncated), 0)
+             FROM executions
+             WHERE workspace_id = ?1 AND created_at_ms >= ?2 AND created_at_ms <= ?3",
+            filter,
+            |row| {
+                Ok((
+                    row_u64(row, 0)?,
+                    ExecutionStatusCounts {
+                        queued: row_u64(row, 1)?,
+                        running: row_u64(row, 2)?,
+                        exited_zero: row_u64(row, 3)?,
+                        exited_nonzero: row_u64(row, 4)?,
+                        signaled: row_u64(row, 5)?,
+                        spawn_error: row_u64(row, 6)?,
+                        cancelled: row_u64(row, 7)?,
+                        interrupted: row_u64(row, 8)?,
+                        unknown_terminal: row_u64(row, 9)?,
+                    },
+                    row_u64(row, 10)?,
+                    row_u64(row, 11)?,
+                ))
+            },
+        )?;
+
+        let mut initiator_statement = connection.prepare(
+            "SELECT
+                COALESCE(NULLIF(json_extract(initiator_json, '$.kind'), ''), 'unknown'),
+                COUNT(*)
+             FROM executions
+             WHERE workspace_id = ?1 AND created_at_ms >= ?2 AND created_at_ms <= ?3
+             GROUP BY 1 ORDER BY 1",
+        )?;
+        let by_initiator = initiator_statement
+            .query_map(filter, |row| {
+                Ok(InitiatorStats {
+                    kind: row.get(0)?,
+                    count: row_u64(row, 1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let (duration_samples, duration_p50_ms, duration_p95_ms) = connection.query_row(
+            "WITH ranked AS (
+                SELECT
+                    CASE WHEN ended_at_ms >= started_at_ms
+                        THEN ended_at_ms - started_at_ms ELSE 0 END AS duration_ms,
+                    ROW_NUMBER() OVER (ORDER BY CASE WHEN ended_at_ms >= started_at_ms
+                        THEN ended_at_ms - started_at_ms ELSE 0 END) AS rank_number,
+                    COUNT(*) OVER () AS sample_count
+                FROM executions
+                WHERE workspace_id = ?1 AND created_at_ms >= ?2 AND created_at_ms <= ?3
+                    AND state IN ('finished', 'cancelled', 'interrupted')
+                    AND started_at_ms IS NOT NULL AND ended_at_ms IS NOT NULL
+             )
+             SELECT
+                COALESCE(MAX(sample_count), 0),
+                MAX(CASE WHEN rank_number = ((sample_count * 50 + 99) / 100)
+                    THEN duration_ms END),
+                MAX(CASE WHEN rank_number = ((sample_count * 95 + 99) / 100)
+                    THEN duration_ms END)
+             FROM ranked",
+            filter,
+            |row| {
+                Ok((
+                    row_u64(row, 0)?,
+                    row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                    row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                ))
+            },
+        )?;
+
+        Ok(ExecutionStats {
+            workspace,
+            since_ms,
+            until_ms,
+            total,
+            status,
+            by_initiator,
+            captured_bytes,
+            truncated_executions,
+            duration_samples,
+            duration_p50_ms,
+            duration_p95_ms,
+        })
     }
 
     pub fn read_output(
@@ -994,6 +1133,14 @@ fn workspace_from_row(row: &Row<'_>) -> rusqlite::Result<Workspace> {
     })
 }
 
+fn workspace_with_active_from_row(row: &Row<'_>) -> rusqlite::Result<(Workspace, bool)> {
+    Ok((workspace_from_row(row)?, row.get::<_, i64>(4)? != 0))
+}
+
+fn row_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    row.get::<_, i64>(index).map(|value| value.max(0) as u64)
+}
+
 fn execution_from_row(row: &Row<'_>) -> rusqlite::Result<Execution> {
     let state: String = row.get(2)?;
     let command_json: String = row.get(3)?;
@@ -1074,95 +1221,6 @@ fn output_event(
             data_base64: base64::engine::general_purpose::STANDARD.encode(data),
         },
     }
-}
-
-fn build_execution_stats(
-    workspace: Workspace,
-    executions: Vec<Execution>,
-    since_ms: i64,
-    until_ms: i64,
-) -> ExecutionStats {
-    let mut status = ExecutionStatusCounts::default();
-    let mut initiators = BTreeMap::<String, u64>::new();
-    let mut captured_bytes = 0_u64;
-    let mut truncated_executions = 0_u64;
-    let mut durations = Vec::new();
-
-    for execution in &executions {
-        captured_bytes = captured_bytes.saturating_add(execution.captured_bytes);
-        if execution.output_truncated {
-            truncated_executions = truncated_executions.saturating_add(1);
-        }
-        let initiator = initiators
-            .entry(execution.initiator.kind.clone())
-            .or_default();
-        *initiator = initiator.saturating_add(1);
-
-        match (&execution.state, &execution.outcome) {
-            (ExecutionState::Queued, _) => status.queued = status.queued.saturating_add(1),
-            (ExecutionState::Running, _) => status.running = status.running.saturating_add(1),
-            (ExecutionState::Cancelled, _) => status.cancelled = status.cancelled.saturating_add(1),
-            (ExecutionState::Interrupted, _) => {
-                status.interrupted = status.interrupted.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::Exited { code: 0 })) => {
-                status.exited_zero = status.exited_zero.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::Exited { .. })) => {
-                status.exited_nonzero = status.exited_nonzero.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::Signaled { .. })) => {
-                status.signaled = status.signaled.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::SpawnError { .. })) => {
-                status.spawn_error = status.spawn_error.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::Cancelled { .. })) => {
-                status.cancelled = status.cancelled.saturating_add(1)
-            }
-            (ExecutionState::Finished, Some(ExecutionOutcome::Interrupted { .. })) => {
-                status.interrupted = status.interrupted.saturating_add(1)
-            }
-            (ExecutionState::Finished, None) => {
-                status.unknown_terminal = status.unknown_terminal.saturating_add(1)
-            }
-        }
-
-        if execution.state.is_terminal()
-            && let (Some(started), Some(ended)) = (execution.started_at_ms, execution.ended_at_ms)
-        {
-            durations.push(ended.saturating_sub(started).max(0) as u64);
-        }
-    }
-
-    durations.sort_unstable();
-    ExecutionStats {
-        workspace,
-        since_ms,
-        until_ms,
-        total: executions.len() as u64,
-        status,
-        by_initiator: initiators
-            .into_iter()
-            .map(|(kind, count)| InitiatorStats { kind, count })
-            .collect(),
-        captured_bytes,
-        truncated_executions,
-        duration_samples: durations.len() as u64,
-        duration_p50_ms: nearest_rank(&durations, 50),
-        duration_p95_ms: nearest_rank(&durations, 95),
-    }
-}
-
-fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let rank = percentile
-        .saturating_mul(sorted.len())
-        .div_ceil(100)
-        .clamp(1, sorted.len());
-    sorted.get(rank - 1).copied()
 }
 
 fn event_from_row(
@@ -1256,52 +1314,44 @@ mod tests {
         }
     }
 
-    fn workspace() -> Workspace {
-        Workspace {
-            id: "workspace-id".into(),
-            name: "test".into(),
-            root: "/tmp/test".into(),
-            created_at_ms: 1,
-        }
-    }
-
-    fn execution(
+    fn insert_execution(
+        database: &Database,
+        workspace_id: &str,
         id: &str,
         state: ExecutionState,
         outcome: Option<ExecutionOutcome>,
         initiator: &str,
         duration_ms: Option<u64>,
-    ) -> Execution {
+    ) {
         let (started_at_ms, ended_at_ms) = duration_ms
             .map(|duration| (Some(1_000), Some(1_000 + duration as i64)))
             .unwrap_or((None, None));
-        Execution {
-            id: id.into(),
-            workspace_id: "workspace-id".into(),
-            state,
-            command: CommandSpec::Argv {
-                program: "true".into(),
-                args: Vec::new(),
-            },
-            command_display: "true".into(),
-            cwd: "/tmp/test".into(),
-            env_keys: Vec::new(),
-            initiator: Initiator {
-                kind: initiator.into(),
-                name: None,
-                session_id: None,
-            },
-            created_at_ms: 1_000,
-            started_at_ms,
-            ended_at_ms,
-            duration_ms,
-            pid: None,
-            pgid: None,
-            outcome,
-            captured_bytes: 10,
-            output_truncated: id == "spawn-error",
-            last_seq: 0,
-        }
+        database
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO executions(
+                    id, workspace_id, state, command_json, cwd, env_keys_json,
+                    initiator_json, created_at_ms, started_at_ms, ended_at_ms,
+                    outcome_json, captured_bytes, output_truncated
+                 ) VALUES (?1, ?2, ?3, 'not-json', '/tmp/test', '[]', ?4, 100, ?5, ?6, ?7, 10, ?8)",
+                params![
+                    id,
+                    workspace_id,
+                    state.as_str(),
+                    serde_json::to_string(&Initiator {
+                        kind: initiator.into(),
+                        name: None,
+                        session_id: None,
+                    })
+                    .unwrap(),
+                    started_at_ms,
+                    ended_at_ms,
+                    outcome.map(|value| serde_json::to_string(&value).unwrap()),
+                    i64::from(id == "spawn-error"),
+                ],
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1367,7 +1417,10 @@ mod tests {
 
     #[test]
     fn builds_empty_execution_stats() {
-        let stats = build_execution_stats(workspace(), Vec::new(), 100, 200);
+        let database = Database::open(StoreLocation::Memory).unwrap();
+        let root = tempdir().unwrap();
+        let workspace = database.add_workspace("test", root.path()).unwrap();
+        let stats = database.execution_stats(&workspace.id, 100, 200).unwrap();
 
         assert_eq!(stats.total, 0);
         assert_eq!(stats.status, ExecutionStatusCounts::default());
@@ -1378,31 +1431,34 @@ mod tests {
 
     #[test]
     fn classifies_every_execution_and_sorts_initiators() {
-        let executions = vec![
-            execution("queued", ExecutionState::Queued, None, "mcp", None),
-            execution("running", ExecutionState::Running, None, "cli", None),
-            execution(
+        let database = Database::open(StoreLocation::Memory).unwrap();
+        let root = tempdir().unwrap();
+        let workspace = database.add_workspace("test", root.path()).unwrap();
+        let records = [
+            ("queued", ExecutionState::Queued, None, "mcp", None),
+            ("running", ExecutionState::Running, None, "cli", None),
+            (
                 "success",
                 ExecutionState::Finished,
                 Some(ExecutionOutcome::Exited { code: 0 }),
                 "mcp",
                 Some(10),
             ),
-            execution(
+            (
                 "failure",
                 ExecutionState::Finished,
                 Some(ExecutionOutcome::Exited { code: 2 }),
                 "cli",
                 Some(20),
             ),
-            execution(
+            (
                 "signaled",
                 ExecutionState::Finished,
                 Some(ExecutionOutcome::Signaled { signal: 9 }),
                 "cli",
                 Some(30),
             ),
-            execution(
+            (
                 "spawn-error",
                 ExecutionState::Finished,
                 Some(ExecutionOutcome::SpawnError {
@@ -1411,14 +1467,14 @@ mod tests {
                 "cli",
                 Some(40),
             ),
-            execution(
+            (
                 "cancelled",
                 ExecutionState::Cancelled,
                 Some(ExecutionOutcome::Cancelled { signal: Some(15) }),
                 "cli",
                 Some(50),
             ),
-            execution(
+            (
                 "interrupted",
                 ExecutionState::Interrupted,
                 Some(ExecutionOutcome::Interrupted {
@@ -1427,10 +1483,21 @@ mod tests {
                 "cli",
                 Some(60),
             ),
-            execution("unknown", ExecutionState::Finished, None, "cli", Some(70)),
+            ("unknown", ExecutionState::Finished, None, "cli", Some(70)),
         ];
+        for (id, state, outcome, initiator, duration) in records {
+            insert_execution(
+                &database,
+                &workspace.id,
+                id,
+                state,
+                outcome,
+                initiator,
+                duration,
+            );
+        }
 
-        let stats = build_execution_stats(workspace(), executions, 100, 200);
+        let stats = database.execution_stats(&workspace.id, 0, 200).unwrap();
 
         assert_eq!(stats.total, 9);
         assert_eq!(stats.status.queued, 1);
@@ -1464,11 +1531,138 @@ mod tests {
 
     #[test]
     fn nearest_rank_handles_boundaries() {
-        assert_eq!(nearest_rank(&[], 50), None);
-        assert_eq!(nearest_rank(&[7], 50), Some(7));
-        assert_eq!(nearest_rank(&[10, 20], 50), Some(10));
-        assert_eq!(nearest_rank(&[10, 20], 95), Some(20));
-        assert_eq!(nearest_rank(&[10, 20, 30, 40], 50), Some(20));
+        let database = Database::open(StoreLocation::Memory).unwrap();
+        let root = tempdir().unwrap();
+        let workspace = database.add_workspace("test", root.path()).unwrap();
+        for (id, duration) in [("first", 10), ("second", 20)] {
+            insert_execution(
+                &database,
+                &workspace.id,
+                id,
+                ExecutionState::Finished,
+                Some(ExecutionOutcome::Exited { code: 0 }),
+                "cli",
+                Some(duration),
+            );
+        }
+
+        let stats = database.execution_stats(&workspace.id, 0, 200).unwrap();
+        assert_eq!(stats.duration_p50_ms, Some(10));
+        assert_eq!(stats.duration_p95_ms, Some(20));
+    }
+
+    #[test]
+    fn workspace_registration_is_idempotent_and_preserves_history() {
+        let database = Database::open(StoreLocation::Memory).unwrap();
+        let root = tempdir().unwrap();
+        let other_root = tempdir().unwrap();
+        let workspace = database.add_workspace("test", root.path()).unwrap();
+        let duplicate = database.add_workspace("test", root.path()).unwrap();
+        assert_eq!(duplicate.id, workspace.id);
+        let execution = database
+            .create_execution(&request(workspace.id.clone()), root.path())
+            .unwrap();
+
+        database.remove_workspace("test").unwrap();
+        database.remove_workspace("test").unwrap();
+        assert!(database.list_workspaces().unwrap().is_empty());
+        assert!(matches!(
+            database.get_workspace("test"),
+            Err(Error::WorkspaceNotFound(_))
+        ));
+        assert_eq!(
+            database.get_execution(&execution.id).unwrap().id,
+            execution.id
+        );
+
+        let reactivated = database.add_workspace("test", root.path()).unwrap();
+        assert_eq!(reactivated.id, workspace.id);
+        assert_eq!(database.list_workspaces().unwrap().len(), 1);
+        assert!(matches!(
+            database.add_workspace("renamed", root.path()),
+            Err(Error::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            database.add_workspace("test", other_root.path()),
+            Err(Error::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn migrates_v1_workspaces_as_active() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("legacy.db");
+        let root = temp.path().canonicalize().unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE workspaces (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        root TEXT NOT NULL UNIQUE,
+                        created_at_ms INTEGER NOT NULL
+                     );
+                     CREATE TABLE executions (
+                        id TEXT PRIMARY KEY,
+                        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                        state TEXT NOT NULL,
+                        command_json TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        env_keys_json TEXT NOT NULL,
+                        initiator_json TEXT NOT NULL,
+                        created_at_ms INTEGER NOT NULL,
+                        started_at_ms INTEGER,
+                        ended_at_ms INTEGER,
+                        pid INTEGER,
+                        pgid INTEGER,
+                        outcome_json TEXT,
+                        captured_bytes INTEGER NOT NULL DEFAULT 0,
+                        output_truncated INTEGER NOT NULL DEFAULT 0,
+                        last_seq INTEGER NOT NULL DEFAULT 0
+                     );
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO workspaces(id, name, root, created_at_ms)
+                     VALUES ('legacy-id', 'legacy', ?1, 1)",
+                    [root.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO executions(
+                        id, workspace_id, state, command_json, cwd, env_keys_json,
+                        initiator_json, created_at_ms, started_at_ms, ended_at_ms,
+                        outcome_json, captured_bytes
+                     ) VALUES (
+                        'legacy-execution', 'legacy-id', 'finished',
+                        '{\"kind\":\"argv\",\"program\":\"true\",\"args\":[]}',
+                        ?1, '[]', '{\"kind\":\"cli\"}', 100, 100, 110,
+                        '{\"kind\":\"exited\",\"code\":0}', 4
+                     )",
+                    [root.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+        }
+
+        let database = Database::open(StoreLocation::Path(path)).unwrap();
+        assert_eq!(database.list_workspaces().unwrap()[0].id, "legacy-id");
+        assert_eq!(
+            database.get_execution("legacy-execution").unwrap().id,
+            "legacy-execution"
+        );
+        assert_eq!(database.execution_stats("legacy", 0, 200).unwrap().total, 1);
+        assert_eq!(
+            database
+                .connection()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

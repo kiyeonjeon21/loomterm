@@ -157,6 +157,58 @@ async fn enforces_workspace_boundary_and_capture_limit() {
 }
 
 #[tokio::test]
+async fn inactive_workspace_blocks_new_execution_and_can_be_reactivated() {
+    let temp = TempDir::new().unwrap();
+    let store = Store::open(&temp.path().join("loom.db")).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
+    let engine = ExecutionEngine::new(store.clone(), settings());
+    let first = engine
+        .execute(request(
+            workspace.id.clone(),
+            CommandSpec::Argv {
+                program: "/usr/bin/true".into(),
+                args: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    let first = wait_terminal(&engine, &first.id).await;
+
+    store.remove_workspace("test").await.unwrap();
+    assert!(store.list_workspaces().await.unwrap().is_empty());
+    assert!(matches!(
+        engine
+            .execute(request(
+                workspace.id.clone(),
+                CommandSpec::Argv {
+                    program: "/usr/bin/true".into(),
+                    args: Vec::new(),
+                },
+            ))
+            .await,
+        Err(loomterm::Error::WorkspaceNotFound(_))
+    ));
+    assert_eq!(store.get_execution(&first.id).await.unwrap().id, first.id);
+
+    let reactivated = store.add_workspace("test", temp.path()).await.unwrap();
+    assert_eq!(reactivated.id, workspace.id);
+    let second = engine
+        .execute(request(
+            reactivated.id,
+            CommandSpec::Argv {
+                program: "/usr/bin/true".into(),
+                args: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_terminal(&engine, &second.id).await.outcome,
+        Some(ExecutionOutcome::Exited { code: 0 })
+    );
+}
+
+#[tokio::test]
 async fn cancels_the_running_process_group() {
     let temp = TempDir::new().unwrap();
     let store = Store::open(&temp.path().join("loom.db")).unwrap();

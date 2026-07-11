@@ -8,7 +8,7 @@ use loomterm::config::{AppPaths, Settings};
 use loomterm::executor::ExecutionEngine;
 use loomterm::model::{
     CommandSpec, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest, ExecutionState,
-    Initiator, OutputStream,
+    Initiator, OutputStream, now_ms,
 };
 use loomterm::store::Store;
 use nix::sys::signal::kill;
@@ -261,6 +261,58 @@ async fn daemon_keeps_execution_across_client_connections() {
     }));
 
     second_client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn daemon_reports_workspace_statistics() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let daemon_paths = paths.clone();
+    let daemon = tokio::spawn(async move { loomterm::daemon::run(daemon_paths, settings()).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("test".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let execution = client
+        .execute(request(
+            workspace.id.clone(),
+            CommandSpec::Argv {
+                program: "/usr/bin/printf".into(),
+                args: vec!["stats".into()],
+            },
+        ))
+        .await
+        .unwrap();
+    let mut cursor = 0;
+    loop {
+        let response = client
+            .wait(execution.id.clone(), cursor, 2_000, 1024)
+            .await
+            .unwrap();
+        cursor = response.next_seq;
+        if response.execution.state.is_terminal() {
+            break;
+        }
+    }
+
+    let stats = client
+        .stats(workspace.id.clone(), now_ms().saturating_sub(60_000))
+        .await
+        .unwrap();
+    assert_eq!(stats.workspace.id, workspace.id);
+    assert_eq!(stats.total, 1);
+    assert_eq!(stats.status.exited_zero, 1);
+    assert_eq!(stats.by_initiator[0].kind, "test");
+    assert_eq!(stats.captured_bytes, 5);
+    assert_eq!(stats.duration_samples, 1);
+
+    client.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), daemon)
         .await
         .unwrap()

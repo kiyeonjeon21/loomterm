@@ -73,7 +73,7 @@ fn shell_escape_for_display(value: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Initiator {
     #[serde(default = "default_client_kind")]
     pub kind: String,
@@ -85,6 +85,16 @@ pub struct Initiator {
 
 fn default_client_kind() -> String {
     "unknown".into()
+}
+
+impl Default for Initiator {
+    fn default() -> Self {
+        Self {
+            kind: default_client_kind(),
+            name: None,
+            session_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -198,7 +208,41 @@ pub struct Execution {
     pub last_seq: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ExecutionStatusCounts {
+    pub queued: u64,
+    pub running: u64,
+    pub exited_zero: u64,
+    pub exited_nonzero: u64,
+    pub signaled: u64,
+    pub spawn_error: u64,
+    pub cancelled: u64,
+    pub interrupted: u64,
+    pub unknown_terminal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct InitiatorStats {
+    pub kind: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ExecutionStats {
+    pub workspace: Workspace,
+    pub since_ms: i64,
+    pub until_ms: i64,
+    pub total: u64,
+    pub status: ExecutionStatusCounts,
+    pub by_initiator: Vec<InitiatorStats>,
+    pub captured_bytes: u64,
+    pub truncated_executions: u64,
+    pub duration_samples: u64,
+    pub duration_p50_ms: Option<u64>,
+    pub duration_p95_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Workspace {
     pub id: String,
     pub name: String,

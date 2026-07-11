@@ -15,7 +15,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::{AppPaths, Settings};
 use crate::executor::ExecutionEngine;
-use crate::model::{ExecutionEventPayload, Health, PROTOCOL_VERSION};
+use crate::model::{ExecutionEventPayload, Health, PROTOCOL_VERSION, now_ms};
 use crate::protocol::{
     MAX_FRAME_BYTES, Operation, ProtocolResult, SubscriptionResponse, WireMessage,
 };
@@ -330,6 +330,14 @@ async fn dispatch(
         Operation::List { workspace, limit } => Ok(ProtocolResult::Executions(
             store
                 .list_executions(workspace.as_deref(), limit.clamp(1, 1000))
+                .await?,
+        )),
+        Operation::Stats {
+            workspace,
+            since_ms,
+        } => Ok(ProtocolResult::Stats(
+            store
+                .execution_stats(&workspace, since_ms, now_ms())
                 .await?,
         )),
         Operation::ReadOutput {

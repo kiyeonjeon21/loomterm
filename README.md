@@ -72,6 +72,17 @@ target/release/loom cancel EXECUTION_ID
 Use `--json` for structured output. `loom run --json` emits JSON Lines containing
 the initial execution, each event, and the terminal result.
 
+Summarize recent activity for one workspace:
+
+```sh
+target/release/loom stats --workspace loomterm --days 7
+target/release/loom stats --workspace loomterm --days 7 --json
+```
+
+When `--workspace` is omitted, `loom stats` selects the most specific registered
+workspace containing the current directory. Statistics are derived from the
+existing local SQLite execution records; Loomterm does not send usage telemetry.
+
 ## MCP setup
 
 This repository includes a project-scoped Codex configuration in
@@ -160,6 +171,9 @@ scripts/codex-smoke.sh
 The integration suite also kills `loomd` with `SIGKILL`, verifies that the
 supervisor removes the command group, proves queued work cannot spawn during
 graceful shutdown, and checks cursor-exact subscription reconnects.
+
+Use [DOGFOOD.md](DOGFOOD.md) to collect a seven-day local baseline before choosing
+the next product investment.
 
 ## Trust boundary
 

@@ -8,7 +8,7 @@ use loomterm::client::DaemonClient;
 use loomterm::config::AppPaths;
 use loomterm::model::{
     CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
-    ExecutionRequest, Initiator,
+    ExecutionRequest, ExecutionStats, Initiator, now_ms,
 };
 use loomterm::{Error, Result};
 
@@ -45,6 +45,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 100)]
         limit: u32,
     },
+    Stats(StatsArgs),
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor,
@@ -103,6 +104,19 @@ struct LogsArgs {
     after_seq: u64,
     #[arg(long, default_value_t = 1024 * 1024)]
     max_bytes: usize,
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    #[arg(short, long)]
+    workspace: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 7,
+        value_parser = clap::value_parser!(u32).range(1..=3650),
+        help = "Number of recent days to summarize"
+    )]
+    days: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,6 +181,19 @@ async fn run(cli: Cli) -> Result<i32> {
                         execution.command_display
                     );
                 }
+            }
+            Ok(0)
+        }
+        Commands::Stats(args) => {
+            let workspace = resolve_workspace(&client, args.workspace.as_deref()).await?;
+            let window_ms = i64::from(args.days) * 24 * 60 * 60 * 1_000;
+            let stats = client
+                .stats(workspace, now_ms().saturating_sub(window_ms))
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!("{}", format_stats(&stats));
             }
             Ok(0)
         }
@@ -455,4 +482,133 @@ fn short_id(id: &str) -> &str {
 
 fn workspace_label(id: &str) -> String {
     short_id(id).to_owned()
+}
+
+fn format_stats(stats: &ExecutionStats) -> String {
+    let initiators = if stats.by_initiator.is_empty() {
+        "none".to_owned()
+    } else {
+        stats
+            .by_initiator
+            .iter()
+            .map(|item| format!("{} {}", item.kind, item.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        concat!(
+            "Workspace: {} ({})\n",
+            "Window: {}..{} (epoch ms)\n",
+            "Executions: {}\n",
+            "Status:\n",
+            "  queued: {}\n",
+            "  running: {}\n",
+            "  exited 0: {}\n",
+            "  exited nonzero: {}\n",
+            "  signaled: {}\n",
+            "  spawn error: {}\n",
+            "  cancelled: {}\n",
+            "  interrupted: {}\n",
+            "  unknown terminal: {}\n",
+            "Initiators: {}\n",
+            "Captured output: {}\n",
+            "Truncated executions: {}\n",
+            "Duration samples: {}\n",
+            "Duration p50: {}\n",
+            "Duration p95: {}",
+        ),
+        stats.workspace.name,
+        short_id(&stats.workspace.id),
+        stats.since_ms,
+        stats.until_ms,
+        stats.total,
+        stats.status.queued,
+        stats.status.running,
+        stats.status.exited_zero,
+        stats.status.exited_nonzero,
+        stats.status.signaled,
+        stats.status.spawn_error,
+        stats.status.cancelled,
+        stats.status.interrupted,
+        stats.status.unknown_terminal,
+        initiators,
+        format_bytes(stats.captured_bytes),
+        stats.truncated_executions,
+        stats.duration_samples,
+        format_duration(stats.duration_p50_ms),
+        format_duration(stats.duration_p95_ms),
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TiB", 1024_u64.pow(4)),
+        ("GiB", 1024_u64.pow(3)),
+        ("MiB", 1024_u64.pow(2)),
+        ("KiB", 1024),
+    ];
+    for (unit, divisor) in UNITS {
+        if bytes >= divisor {
+            return format!(
+                "{:.1} {unit} ({bytes} bytes)",
+                bytes as f64 / divisor as f64
+            );
+        }
+    }
+    format!("{bytes} bytes")
+}
+
+fn format_duration(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".into(), |milliseconds| format!("{milliseconds} ms"))
+}
+
+#[cfg(test)]
+mod tests {
+    use loomterm::model::{ExecutionStats, ExecutionStatusCounts, InitiatorStats, Workspace};
+
+    use super::*;
+
+    #[test]
+    fn formats_stats_for_humans() {
+        let stats = ExecutionStats {
+            workspace: Workspace {
+                id: "01234567-rest".into(),
+                name: "loomterm".into(),
+                root: "/tmp/loomterm".into(),
+                created_at_ms: 0,
+            },
+            since_ms: 100,
+            until_ms: 200,
+            total: 3,
+            status: ExecutionStatusCounts {
+                exited_zero: 2,
+                exited_nonzero: 1,
+                ..ExecutionStatusCounts::default()
+            },
+            by_initiator: vec![InitiatorStats {
+                kind: "cli".into(),
+                count: 3,
+            }],
+            captured_bytes: 1536,
+            truncated_executions: 1,
+            duration_samples: 3,
+            duration_p50_ms: Some(12),
+            duration_p95_ms: Some(90),
+        };
+
+        let output = format_stats(&stats);
+        assert!(output.contains("Workspace: loomterm (01234567)"));
+        assert!(output.contains("Executions: 3"));
+        assert!(output.contains("Status:\n  queued: 0\n  running: 0"));
+        assert!(output.contains("Initiators: cli 3"));
+        assert!(output.contains("Captured output: 1.5 KiB (1536 bytes)"));
+        assert!(output.contains("Duration p95: 90 ms"));
+    }
+
+    #[test]
+    fn formats_empty_duration_and_small_bytes() {
+        assert_eq!(format_duration(None), "n/a");
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(1023), "1023 bytes");
+    }
 }

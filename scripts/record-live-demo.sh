@@ -54,8 +54,8 @@ wait_for_agent_tui() {
     title_pattern='OpenAI Codex'
     ready_pattern='OpenAI Codex'
   else
-    title_pattern='Claude Code'
-    ready_pattern='Try "'
+    title_pattern='Claude Code v'
+    ready_pattern='Claude Code v'
   fi
   while ((SECONDS < deadline)); do
     screen=$(tmux capture-pane -p -S -160 -t "$left" 2>/dev/null)
@@ -145,31 +145,40 @@ stop_interactive_agent() {
   tmux send-keys -t "$left" Enter
 }
 
-agent_command() {
+agent_arguments() {
   local agent=$1
   local -a argv
   if [[ "$agent" == codex ]]; then
     argv=(
-      codex
       --yolo
       --dangerously-bypass-hook-trust
       --model "$codex_model"
       -c 'model_reasoning_effort="xhigh"'
     )
   else
-    argv=(claude --dangerously-skip-permissions)
+    argv=(--dangerously-skip-permissions)
   fi
   printf '%q ' "${argv[@]}"
 }
 
-start_recording() {
+start_agent() {
   local agent=$1
   local name=$2
   local delay=$3
   local command
-  command=$(agent_command "$agent")
+  command=$(agent_arguments "$agent")
   tmux send-keys -l -t "$left" \
-    "sleep $delay; loom session record --agent $agent --name $name -- $command"
+    "sleep $delay; loom agent --name $name $agent -- $command"
+  tmux send-keys -t "$left" Enter
+}
+
+start_handoff() {
+  local source_session=$1
+  local delay=$2
+  local command
+  command=$(agent_arguments claude)
+  tmux send-keys -l -t "$left" \
+    "sleep $delay; loom handoff --from $source_session --name claude-handoff claude -- $command"
   tmux send-keys -t "$left" Enter
 }
 
@@ -236,7 +245,7 @@ for execution in detail.get("executions", []):
   tmux send-keys -t "$left" clear Enter
   tmux send-keys -l -t "$left" "printf 'PHASE 2  CLAUDE TAKES OVER\\n'"
   tmux send-keys -t "$left" Enter
-  start_recording claude claude-handoff 2
+  start_handoff "$source_session" 2
   wait_for_agent_tui claude || {
     echo "Claude TUI did not become ready" >&2
     return 1
@@ -246,10 +255,6 @@ for execution in detail.get("executions", []):
     return 1
   }
   switch_observer
-  tmux send-keys -l -t "$left" "$target_prompt"
-  tmux send-keys -t "$left" Enter
-  sleep 0.5
-  [[ -n $(turn_state "$target_session") ]] || tmux send-keys -t "$left" Enter
   state=$(wait_for_turn "$target_session") || {
     echo "Claude turn did not finish" >&2
     return 1
@@ -279,11 +284,10 @@ ln -s "$repo/target/release/loom" "$bin_dir/loom"
 ln -s "$repo/target/release/loom-mcp" "$bin_dir/loom-mcp"
 ln -s "$repo/target/release/loomd" "$bin_dir/loomd"
 ln -s "$repo/target/release/loom-supervisor" "$bin_dir/loom-supervisor"
-"$bin_dir/loom" init "$fixture" --name live-demo --agent both >/dev/null
+PATH="$bin_dir:$PATH" "$bin_dir/loom" init "$fixture" --name live-demo --agent both >/dev/null
 printf '\n.codex/\n.claude/\n.mcp.json\n' >> "$fixture/.git/info/exclude"
 
-source_prompt="Start the long-running handoff worker with Loomterm MCP using program python3 and args -u handoff_worker.py. Set wait_ms=1000. Once loom_run returns a running execution, report its full execution ID and stop. Do not wait for it, cancel it, or use the shell tool. Keep the final answer brief."
-target_prompt="A previous Codex session left a Loomterm execution running in this workspace. Use Loomterm MCP only: call loom_list to find the running python3 -u handoff_worker.py execution, use loom_read to inspect its existing progress, cancel that same execution with loom_cancel, then use loom_get or loom_wait to verify its state is cancelled. Do not use the shell tool or start another execution. Include the full execution ID in the final answer."
+source_prompt="Start python3 -u handoff_worker.py as a durable long-running task for a handoff demo. Wait only long enough to confirm it is running, report its full execution ID, and stop. Do not wait for completion or cancel it. The next agent should inspect its progress and cancel it safely. Keep the final answer brief."
 
 tmux new-session -d -x 160 -y 48 -s "$tmux_session" -n demo
 tmux set-option -t "$tmux_session" remain-on-exit on
@@ -292,7 +296,7 @@ right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
 setup="cd '$fixture' && unset NO_COLOR && export TERM=xterm-256color COLORTERM=truecolor PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' && clear"
 
 tmux send-keys -t "$left" "$setup" Enter
-start_recording codex codex-starts-worker 3
+start_agent codex codex-starts-worker 3
 tmux send-keys -t "$right" "$setup" Enter
 tmux send-keys -t "$right" "sleep 3.5; loom watch --active" Enter
 tmux select-layout -t "$tmux_session":demo even-horizontal >/dev/null
@@ -360,25 +364,31 @@ source_json="$root/source.json"
 target_json="$root/target.json"
 "$bin_dir/loom" --json session get "$source_session" > "$source_json"
 "$bin_dir/loom" --json session get "$target_session" > "$target_json"
-python3 - "$source_json" "$target_json" "$source_prompt" "$target_prompt" <<'PY'
+python3 - "$source_json" "$target_json" "$source_prompt" <<'PY'
 import json
 import sys
 
 source = json.load(open(sys.argv[1], encoding="utf-8"))
 target = json.load(open(sys.argv[2], encoding="utf-8"))
-source_prompt, target_prompt = sys.argv[3:]
+source_prompt = sys.argv[3]
 assert source["session"]["state"] == "finished"
 assert target["session"]["state"] == "finished"
 assert any(turn["state"] == "completed" and turn["prompt"] == source_prompt for turn in source["turns"])
-assert any(turn["state"] == "completed" and turn["prompt"] == target_prompt for turn in target["turns"])
+target_turns = [turn for turn in target["turns"] if turn["state"] == "completed"]
+assert len(target_turns) == 1
+target_prompt = target_turns[0]["prompt"]
+assert target_prompt.startswith("Take over durable Loomterm work from the previous codex session")
+assert source["session"]["id"] in target_prompt
 assert len(source["executions"]) == 1
 execution = source["executions"][0]
+assert execution["id"] in target_prompt
 assert execution["state"] == "cancelled"
 assert execution["initiator"]["session_id"] == source["session"]["id"]
 linked = [item for item in target["executions"] if item["id"] == execution["id"]]
 assert len(linked) == 1
 assert linked[0]["state"] == "cancelled"
 assert any(action.get("execution_id") == execution["id"] for action in target["actions"])
+assert all(action["tool_name"].lower() != "bash" for action in source["actions"])
 assert source["session"]["ended_at_ms"] <= target["session"]["created_at_ms"]
 print(execution["id"])
 PY

@@ -4,6 +4,32 @@ use crate::model::{AgentEvent, AgentEventRequest, AgentSession, AgentSessionStat
 use crate::{Error, Result};
 
 pub const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+pub const STRICT_SHELL_ROUTING_ENV: &str = "LOOMTERM_SHELL_ROUTING";
+
+pub fn strict_shell_routing_response(input: &Value) -> Option<Value> {
+    let object = input.as_object()?;
+    if object.get("hook_event_name")?.as_str()? != "PreToolUse"
+        || !object
+            .get("tool_name")?
+            .as_str()?
+            .eq_ignore_ascii_case("bash")
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": concat!(
+                "Native Bash is disabled for this Loomterm session. Retry the same operation with ",
+                "the Loomterm MCP loom_run tool. Use program and args for a simple argv command, or ",
+                "shell_command when shell syntax is required. Preserve the requested cwd and environment. ",
+                "Do not fall back to native Bash. If the command requires an interactive PTY, tell the user ",
+                "to relaunch with --allow-native-shell."
+            )
+        }
+    }))
+}
 
 pub fn hook_cwd(input: &Value) -> Option<&str> {
     input.get("cwd").and_then(Value::as_str)
@@ -123,6 +149,37 @@ fn find_execution_id_at_depth(value: &Value, depth: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::model::{CommandSpec, ExecutionOutcome};
+
+    #[test]
+    fn strict_routing_denies_only_native_bash_pre_tool_use() {
+        let bash = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"}
+        });
+        let response = strict_shell_routing_response(&bash).unwrap();
+        assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            response["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("loom_run")
+        );
+
+        for input in [
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash"
+            }),
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__loomterm__loom_run"
+            }),
+            serde_json::json!({"hook_event_name": "PreToolUse"}),
+        ] {
+            assert!(strict_shell_routing_response(&input).is_none());
+        }
+    }
 
     fn recording(id: &str, provider: &str, cwd: &str) -> AgentSession {
         AgentSession {

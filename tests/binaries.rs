@@ -53,3 +53,23 @@ fn watch_cli_enforces_interactive_contract() {
             .stderr(predicate::str::contains(expected));
     }
 }
+
+#[test]
+fn strict_agent_hook_denies_native_bash_without_contacting_the_daemon() {
+    let input = serde_json::json!({
+        "session_id": "provider-session",
+        "hook_event_name": "PreToolUse",
+        "tool_use_id": "tool-1",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo test"},
+        "cwd": "/tmp"
+    });
+    assert_cmd::cargo::cargo_bin_cmd!("loom")
+        .env("LOOMTERM_SHELL_ROUTING", "strict")
+        .args(["agent-event", "--provider", "codex"])
+        .write_stdin(serde_json::to_vec(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"permissionDecision\":\"deny\""))
+        .stdout(predicate::str::contains("loom_run"));
+}

@@ -195,18 +195,22 @@ be included in export review and redaction.
 
 ## Cross-agent handoff validation: 2026-07-12
 
-The handoff candidate records two real interactive sessions in one workspace.
-Codex starts `python3 -u handoff_worker.py` through MCP, reports execution
-`019f564b-ded3-7b00-a899-c78ba0bdcafb`, and exits while the worker remains
-running. Claude Code then lists that same execution, reads its accumulated
-checkpoints, cancels it, and verifies the `cancelled` state without starting a
-replacement process or using a shell tool.
+The handoff launcher records two real interactive sessions in one workspace.
+The user asks `loom agent codex` to start `python3 -u handoff_worker.py` without
+naming Loomterm or an MCP tool. Strict routing keeps native Bash from executing,
+and Codex reports durable execution `019f56b9-ccda-7332-b913-c35bf6b3e17c`
+before exiting while the worker remains running. `loom handoff claude` then
+injects the source request and execution metadata. Claude lists that same
+execution, reads its accumulated checkpoints, cancels it, and verifies the
+`cancelled` state without starting a replacement process or using native Bash.
 
-The 60-second capture and both HTML replays passed automated assertions for the
+The 80-second capture and both HTML replays passed automated assertions for the
 exact prompts, completed turns, shared execution ID, source-session ownership,
 target-session action link, final state, session ordering, and a clean fixture
-worktree. Store validation rejects an execution link from another workspace;
-the runtime integration test also exercises takeover and cancellation against a
-real daemon. This validates local continuity between supported agents. It does
-not yet validate external demand, remote handoff, autonomous scheduling, or a
-GUI terminal as the next product investment.
+worktree. The workflow also asserts that no native Bash action was recorded in
+the source session. Store validation rejects an execution link from another
+workspace; the runtime integration test exercises takeover and cancellation
+against a real daemon. This validates a local launcher-driven continuity flow
+between supported agents. It does not yet validate external demand, remote
+handoff, autonomous scheduling, or a GUI terminal as the next product
+investment.

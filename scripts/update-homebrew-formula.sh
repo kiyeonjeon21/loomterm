@@ -42,7 +42,6 @@ cat > "$formula" <<EOF
 class Loomterm < Formula
   desc "Durable, structured command runtime for coding agents"
   homepage "https://github.com/$repo"
-  version "$version"
   license "MIT"
 
   on_macos do

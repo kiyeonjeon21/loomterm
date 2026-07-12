@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
+use tempfile::TempDir;
 
 fn assert_version(mut command: Command, name: &str) {
     command
@@ -17,4 +19,37 @@ fn every_distributed_binary_reports_its_version() {
         assert_cmd::cargo::cargo_bin_cmd!("loom-supervisor"),
         "loom-supervisor",
     );
+}
+
+#[test]
+fn watch_cli_enforces_interactive_contract() {
+    assert_cmd::cargo::cargo_bin_cmd!("loom")
+        .args(["watch", "session", "--active"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    let temp = TempDir::new().unwrap();
+    for extra in [["--json", "watch", "session"], ["watch", "session", ""]] {
+        let mut command = assert_cmd::cargo::cargo_bin_cmd!("loom");
+        command
+            .env("LOOMTERM_STATE_DIR", temp.path().join("state"))
+            .env("LOOMTERM_RUNTIME_DIR", temp.path().join("run"))
+            .env("LOOMTERM_CONFIG", temp.path().join("config.toml"))
+            .arg("--no-autostart");
+        if extra[2].is_empty() {
+            command.args(&extra[..2]);
+        } else {
+            command.args(extra);
+        }
+        let expected = if extra[0] == "--json" {
+            "--json is not supported"
+        } else {
+            "requires an interactive terminal"
+        };
+        command
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
 }

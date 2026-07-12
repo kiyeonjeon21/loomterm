@@ -54,6 +54,8 @@ enum Commands {
         limit: u32,
     },
     Stats(StatsArgs),
+    /// Observe a recorded agent session and its structured executions live.
+    Watch(WatchArgs),
     #[command(subcommand)]
     Session(SessionCommand),
     #[command(subcommand)]
@@ -225,6 +227,20 @@ struct StatsArgs {
     days: u32,
 }
 
+#[derive(Debug, Args)]
+struct WatchArgs {
+    #[arg(
+        value_name = "SESSION_ID",
+        required_unless_present = "active",
+        conflicts_with = "active"
+    )]
+    session_id: Option<String>,
+    #[arg(long, conflicts_with = "session_id")]
+    active: bool,
+    #[arg(short, long, requires = "active")]
+    workspace: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Start,
@@ -350,6 +366,7 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Commands::Watch(args) => watch_session(&client, args, cli.json).await,
         Commands::Session(command) => handle_session(&client, &paths, command, cli.json).await,
         Commands::Daemon(command) => {
             match command {
@@ -406,6 +423,27 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+async fn watch_session(client: &DaemonClient, args: WatchArgs, json: bool) -> Result<i32> {
+    if json {
+        return Err(Error::InvalidRequest(
+            "--json is not supported by interactive session observation".into(),
+        ));
+    }
+    loomterm::watch::ensure_interactive()?;
+    let detail = if let Some(session_id) = args.session_id {
+        client.get_agent_session(session_id).await?
+    } else {
+        let workspace = resolve_workspace(client, args.workspace.as_deref()).await?;
+        let sessions = client.list_agent_sessions(Some(workspace), 100).await?;
+        let session_id = loomterm::watch::active_session_id(&sessions).ok_or_else(|| {
+            Error::InvalidRequest("no active recording session found in this workspace".into())
+        })?;
+        client.get_agent_session(session_id).await?
+    };
+    loomterm::watch::run(client, detail).await?;
+    Ok(0)
 }
 
 fn print_init_plan(plan: &InitPlan, dry_run: bool, json: bool) -> Result<()> {

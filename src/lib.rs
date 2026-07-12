@@ -10,5 +10,6 @@ pub mod protocol;
 pub mod session;
 pub mod store;
 pub mod supervisor;
+pub mod watch;
 
 pub use error::{Error, Result};

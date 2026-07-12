@@ -289,7 +289,7 @@ tmux new-session -d -x 160 -y 48 -s "$tmux_session" -n demo
 tmux set-option -t "$tmux_session" remain-on-exit on
 left=$(tmux display-message -p -t "$tmux_session":demo '#{pane_id}')
 right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
-setup="cd '$fixture' && export PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' && clear"
+setup="cd '$fixture' && unset NO_COLOR && export TERM=xterm-256color COLORTERM=truecolor PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' && clear"
 
 tmux send-keys -t "$left" "$setup" Enter
 start_recording codex codex-starts-worker 3

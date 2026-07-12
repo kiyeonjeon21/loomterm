@@ -208,6 +208,96 @@ pub struct Execution {
     pub last_seq: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionState {
+    Recording,
+    Finished,
+    Interrupted,
+}
+
+impl AgentSessionState {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Recording)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::Finished => "finished",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSession {
+    pub id: String,
+    pub workspace_id: String,
+    pub state: AgentSessionState,
+    pub agent_kind: String,
+    pub name: Option<String>,
+    pub command: CommandSpec,
+    pub command_display: String,
+    pub cwd: String,
+    pub created_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub duration_ms: Option<u64>,
+    pub recorder_pid: u32,
+    pub outcome: Option<ExecutionOutcome>,
+    pub captured_bytes: u64,
+    pub output_truncated: bool,
+    pub initial_cols: u16,
+    pub initial_rows: u16,
+    pub cast_path: String,
+    pub html_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSessionRequest {
+    pub id: String,
+    pub workspace_id: String,
+    pub agent_kind: String,
+    pub name: Option<String>,
+    pub command: CommandSpec,
+    pub cwd: String,
+    pub recorder_pid: u32,
+    pub initial_cols: u16,
+    pub initial_rows: u16,
+    pub cast_path: String,
+    pub html_path: String,
+}
+
+impl AgentSessionRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.is_empty() || self.workspace_id.is_empty() || self.agent_kind.trim().is_empty() {
+            return Err(Error::InvalidRequest(
+                "id, workspace_id, and agent_kind must not be empty".into(),
+            ));
+        }
+        if self.initial_cols == 0 || self.initial_rows == 0 {
+            return Err(Error::InvalidRequest(
+                "terminal dimensions must be greater than zero".into(),
+            ));
+        }
+        self.command.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSessionFinish {
+    pub state: AgentSessionState,
+    pub outcome: ExecutionOutcome,
+    pub captured_bytes: u64,
+    pub output_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSessionDetail {
+    pub session: AgentSession,
+    pub executions: Vec<Execution>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ExecutionStatusCounts {
     pub queued: u64,
@@ -347,4 +437,6 @@ pub struct Health {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_executions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_sessions: Option<u64>,
 }

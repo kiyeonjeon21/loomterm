@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
+use fs4::{FileExt, TryLockError};
 use futures::{SinkExt, StreamExt};
 use nix::unistd::Pid;
 use tokio::net::{UnixListener, UnixStream};
@@ -15,10 +16,13 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::{AppPaths, Settings};
 use crate::executor::ExecutionEngine;
-use crate::model::{ExecutionEventPayload, Health, PROTOCOL_VERSION, now_ms};
+use crate::model::{
+    AgentSessionFinish, AgentSessionState, ExecutionEventPayload, ExecutionOutcome, Health,
+    PROTOCOL_VERSION, now_ms,
+};
 use crate::protocol::{
-    CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation, ProtocolResult, SubscriptionResponse,
-    WireMessage,
+    CAPABILITY_AGENT_SESSIONS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation,
+    ProtocolResult, SubscriptionResponse, WireMessage,
 };
 use crate::store::Store;
 use crate::{Error, Result};
@@ -34,6 +38,10 @@ pub async fn run(paths: AppPaths, settings: Settings) -> Result<()> {
     let interrupted = store.reconcile_incomplete().await?;
     if interrupted > 0 {
         tracing::warn!(interrupted, "reconciled incomplete executions");
+    }
+    let interrupted_sessions = reconcile_agent_sessions(&store).await?;
+    if interrupted_sessions > 0 {
+        tracing::warn!(interrupted_sessions, "reconciled incomplete agent sessions");
     }
     let engine = ExecutionEngine::new(store, settings.clone());
     let mut fatal_rx = engine.subscribe_fatal();
@@ -308,15 +316,22 @@ async fn dispatch(
 ) -> Result<ProtocolResult> {
     let store = engine.store();
     match operation {
-        Operation::Health => Ok(ProtocolResult::Health(Health {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_pid: std::process::id(),
-            database_path: paths.database.to_string_lossy().into_owned(),
-            socket_path: paths.socket.to_string_lossy().into_owned(),
-            server_version: Some(env!("CARGO_PKG_VERSION").into()),
-            capabilities: vec![CAPABILITY_EXECUTION_STATS.into()],
-            active_executions: Some(engine.active_executions()),
-        })),
+        Operation::Health => {
+            reconcile_agent_sessions(store).await?;
+            Ok(ProtocolResult::Health(Health {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_pid: std::process::id(),
+                database_path: paths.database.to_string_lossy().into_owned(),
+                socket_path: paths.socket.to_string_lossy().into_owned(),
+                server_version: Some(env!("CARGO_PKG_VERSION").into()),
+                capabilities: vec![
+                    CAPABILITY_EXECUTION_STATS.into(),
+                    CAPABILITY_AGENT_SESSIONS.into(),
+                ],
+                active_executions: Some(engine.active_executions()),
+                active_sessions: Some(store.active_agent_sessions().await?.len() as u64),
+            }))
+        }
         Operation::WorkspaceAdd { name, root } => Ok(ProtocolResult::Workspace(
             store.add_workspace(&name, Path::new(&root)).await?,
         )),
@@ -344,6 +359,45 @@ async fn dispatch(
                 .execution_stats(&workspace, since_ms, now_ms())
                 .await?,
         )),
+        Operation::SessionCreate { request } => {
+            validate_session_paths(paths, &request.id, &request.cast_path, &request.html_path)?;
+            Ok(ProtocolResult::AgentSession(
+                store.create_agent_session(&request).await?,
+            ))
+        }
+        Operation::SessionFinish { session_id, finish } => Ok(ProtocolResult::AgentSession(
+            store.finish_agent_session(&session_id, finish).await?,
+        )),
+        Operation::SessionGet { session_id } => {
+            reconcile_agent_sessions(store).await?;
+            Ok(ProtocolResult::AgentSessionDetail(
+                store.get_agent_session(&session_id).await?,
+            ))
+        }
+        Operation::SessionList { workspace, limit } => {
+            reconcile_agent_sessions(store).await?;
+            Ok(ProtocolResult::AgentSessions(
+                store
+                    .list_agent_sessions(workspace.as_deref(), limit.clamp(1, 1000))
+                    .await?,
+            ))
+        }
+        Operation::SessionDelete { session_id } => {
+            let detail = store.get_agent_session(&session_id).await?;
+            if !detail.session.state.is_terminal() {
+                return Err(Error::InvalidRequest(format!(
+                    "agent session {session_id} is still recording"
+                )));
+            }
+            if let Some(directory) = Path::new(&detail.session.cast_path).parent()
+                && directory.starts_with(&paths.sessions_dir)
+                && directory.exists()
+            {
+                std::fs::remove_dir_all(directory)?;
+            }
+            store.delete_agent_session(&session_id).await?;
+            Ok(ProtocolResult::Empty)
+        }
         Operation::ReadOutput {
             execution_id,
             after_seq,
@@ -378,11 +432,99 @@ async fn dispatch(
         Operation::Cancel { execution_id } => Ok(ProtocolResult::Execution(
             engine.cancel(&execution_id).await?,
         )),
-        Operation::Shutdown => {
+        Operation::Shutdown { force } => {
+            reconcile_agent_sessions(store).await?;
+            let active_sessions = store.active_agent_sessions().await?.len();
+            if !force && active_sessions > 0 {
+                return Err(Error::InvalidRequest(format!(
+                    "daemon has {active_sessions} active agent session(s); wait for them or use --force"
+                )));
+            }
             let _ = shutdown.send(true);
             Ok(ProtocolResult::Empty)
         }
     }
+}
+
+fn validate_session_paths(
+    paths: &AppPaths,
+    session_id: &str,
+    cast_path: &str,
+    html_path: &str,
+) -> Result<()> {
+    let cast = Path::new(cast_path);
+    let html = Path::new(html_path);
+    let Some(directory) = cast.parent() else {
+        return Err(Error::InvalidRequest("cast_path has no parent".into()));
+    };
+    if directory == paths.sessions_dir
+        || !directory.starts_with(&paths.sessions_dir)
+        || html.parent() != Some(directory)
+        || directory.file_name().and_then(|value| value.to_str()) != Some(session_id)
+    {
+        return Err(Error::InvalidRequest(
+            "session artifacts must share a private directory under the Loomterm state directory"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn reconcile_agent_sessions(store: &Store) -> Result<usize> {
+    let mut interrupted = 0;
+    for session in store.active_agent_sessions().await? {
+        let Some(directory) = Path::new(&session.cast_path).parent() else {
+            continue;
+        };
+        let lock_path = directory.join("active.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        match FileExt::try_lock(&lock) {
+            Ok(()) => {
+                let captured_bytes = cast_output_bytes(Path::new(&session.cast_path))
+                    .unwrap_or(session.captured_bytes);
+                store
+                    .finish_agent_session(
+                        &session.id,
+                        AgentSessionFinish {
+                            state: AgentSessionState::Interrupted,
+                            outcome: ExecutionOutcome::Interrupted {
+                                reason: "session recorder exited before finalization".into(),
+                            },
+                            captured_bytes,
+                            output_truncated: session.output_truncated,
+                        },
+                    )
+                    .await?;
+                interrupted += 1;
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(interrupted)
+}
+
+fn cast_output_bytes(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let mut total = 0_u64;
+    for line in std::io::BufReader::new(file).lines().skip(1) {
+        let value: serde_json::Value = serde_json::from_str(&line.ok()?).ok()?;
+        let event = value.as_array()?;
+        if event.get(1).and_then(serde_json::Value::as_str) == Some("o") {
+            total = total.saturating_add(
+                event
+                    .get(2)
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, |text| text.len() as u64),
+            );
+        }
+    }
+    Some(total)
 }
 
 async fn prepare_socket(path: &Path) -> Result<()> {

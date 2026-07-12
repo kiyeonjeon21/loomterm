@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "loomterm": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "--release", "--bin", "loom-mcp"],
+      "env": {}
+    }
+  }
+}

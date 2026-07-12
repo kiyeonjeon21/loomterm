@@ -1,6 +1,6 @@
 [package]
 name = "loomterm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A durable, structured execution runtime for coding agents"
 license = "MIT"
@@ -9,14 +9,18 @@ license = "MIT"
 base64 = "0.22"
 bytes = "1.11"
 clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.29"
 directories = "6.0"
+fs4 = "1.1"
 futures = "0.3"
 nix = { version = "0.31", features = ["process", "signal", "socket", "user"] }
+portable-pty = "0.9"
 rmcp = { version = "2.2", features = ["server", "transport-io"] }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+signal-hook = "0.3"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }

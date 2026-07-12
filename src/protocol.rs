@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::model::{
-    Execution, ExecutionEvent, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION,
-    ReadOutputResponse, WaitResponse, Workspace,
+    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, Execution,
+    ExecutionEvent, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse,
+    WaitResponse, Workspace,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const CAPABILITY_EXECUTION_STATS: &str = "execution_stats_v1";
+pub const CAPABILITY_AGENT_SESSIONS: &str = "agent_sessions_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -98,6 +100,25 @@ pub enum Operation {
         workspace: String,
         since_ms: i64,
     },
+    SessionCreate {
+        request: AgentSessionRequest,
+    },
+    SessionFinish {
+        session_id: String,
+        finish: AgentSessionFinish,
+    },
+    SessionGet {
+        session_id: String,
+    },
+    SessionList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
+    SessionDelete {
+        session_id: String,
+    },
     ReadOutput {
         execution_id: String,
         #[serde(default)]
@@ -122,7 +143,10 @@ pub enum Operation {
     Cancel {
         execution_id: String,
     },
-    Shutdown,
+    Shutdown {
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 pub fn default_list_limit() -> u32 {
@@ -154,6 +178,9 @@ pub enum ProtocolResult {
     Execution(Execution),
     Executions(Vec<Execution>),
     Stats(ExecutionStats),
+    AgentSession(AgentSession),
+    AgentSessions(Vec<AgentSession>),
+    AgentSessionDetail(AgentSessionDetail),
     Output(ReadOutputResponse),
     Wait(WaitResponse),
     Subscription(SubscriptionResponse),
@@ -182,6 +209,7 @@ impl From<&Error> for ProtocolError {
         let code = match error {
             Error::WorkspaceNotFound(_) => "workspace_not_found",
             Error::ExecutionNotFound(_) => "execution_not_found",
+            Error::AgentSessionNotFound(_) => "agent_session_not_found",
             Error::OutsideWorkspace { .. } => "outside_workspace",
             Error::InvalidRequest(_) => "invalid_request",
             Error::AlreadyTerminal(_) => "already_terminal",

@@ -12,6 +12,15 @@ scrape a terminal screen.
 This first version is deliberately headless. It is not a terminal emulator, an
 agent orchestrator, or an LLM client.
 
+## Demo
+
+[![Codex session recorded and correlated by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
+
+[Watch the 41-second capture](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
+or [explore the interactive replay](https://kiyeonjeon21.github.io/loomterm/).
+This real Codex session fixes a failing test while five MCP executions appear
+in Loomterm's correlated timeline.
+
 ## What it provides
 
 - A persistent `loomd` daemon with bounded concurrent execution.

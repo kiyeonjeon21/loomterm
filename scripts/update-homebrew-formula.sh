@@ -46,18 +46,21 @@ class Loomterm < Formula
   license "MIT"
 
   on_macos do
-    if Hardware::CPU.arm?
+    on_arm do
       url "https://github.com/$repo/releases/download/$release/loomterm-v${version}-aarch64-apple-darwin.tar.gz"
       sha256 "$sha_arm_mac"
-    else
+    end
+    on_intel do
       url "https://github.com/$repo/releases/download/$release/loomterm-v${version}-x86_64-apple-darwin.tar.gz"
       sha256 "$sha_intel_mac"
     end
   end
 
   on_linux do
-    url "https://github.com/$repo/releases/download/$release/loomterm-v${version}-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "$sha_linux"
+    on_intel do
+      url "https://github.com/$repo/releases/download/$release/loomterm-v${version}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "$sha_linux"
+    end
   end
 
   def install

@@ -55,12 +55,35 @@ if __name__ == "__main__":
     unittest.main()
 PY
 
+cat > "$destination/handoff_worker.py" <<'PY'
+import signal
+import sys
+import time
+
+
+def stop(signum, _frame):
+    print(f"handoff-worker: cancellation signal {signum}", flush=True)
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, stop)
+print("handoff-worker: started by Codex", flush=True)
+for checkpoint in range(1, 151):
+    print(f"handoff-worker: checkpoint {checkpoint:03d}", flush=True)
+    time.sleep(2)
+
+print("handoff-worker: completed", flush=True)
+PY
+
 cat > "$destination/README.md" <<'EOF'
 # Session report fixture
 
 `session_report.summarize` classifies serialized terminal executions. Fix the
 implementation so the existing test passes without changing the public return
 shape or the test.
+
+`handoff_worker.py` is a deterministic long-running process used to demonstrate
+execution handoff between coding-agent sessions.
 EOF
 
 git -C "$destination" init -q

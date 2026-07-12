@@ -119,23 +119,24 @@
       </video>
     </section>
     <div class="actions">
-      <a href="demo.mp4">Open the 50-second capture</a>
-      <a href="replay.html">Explore the interactive session replay</a>
+      <a href="demo.mp4">Open the 46-second handoff</a>
+      <a href="replay.html">Explore Claude's takeover replay</a>
+      <a href="replay-codex.html">Inspect the Codex origin replay</a>
       <a href="https://github.com/kiyeonjeon21/loomterm#install">Install Loomterm</a>
     </div>
     <section class="details">
       <div class="details-inner">
         <div>
-          <h2>Left: the agent</h2>
-          <p>Codex fixes a failing test inside a session recorded from process start to exit.</p>
+          <h2>Left: two agents</h2>
+          <p>Codex starts a worker and exits. Claude finds that same execution, reads it, and cancels it.</p>
         </div>
         <div>
-          <h2>Right: structured work</h2>
-          <p><code>loom watch --active</code> polls durable execution records, not terminal pixels.</p>
+          <h2>Right: durable work</h2>
+          <p><code>loom watch --active</code> follows the execution across sessions and marks the takeover as a handoff.</p>
         </div>
         <div>
-          <h2>Afterward: replay</h2>
-          <p>The same session produces a local, self-contained replay correlated with its commands.</p>
+          <h2>Afterward: two replays</h2>
+          <p>Each agent keeps a self-contained replay linked by the shared execution ID.</p>
         </div>
       </div>
     </section>

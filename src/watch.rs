@@ -664,6 +664,8 @@ fn render_executions(frame: &mut ratatui::Frame<'_>, state: &WatchState, area: R
         .iter()
         .map(|execution| {
             let (label, style) = execution_status(execution);
+            let handoff =
+                execution.initiator.session_id.as_deref() != Some(state.detail.session.id.as_str());
             let marker = if state.selected_id.as_deref() == Some(&execution.id) {
                 ">"
             } else {
@@ -677,6 +679,10 @@ fn render_executions(frame: &mut ratatui::Frame<'_>, state: &WatchState, area: R
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::raw(" "),
+                Span::styled(
+                    if handoff { "handoff " } else { "" },
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw(execution.command_display.clone()),
             ]))
         })
@@ -693,12 +699,20 @@ fn render_output(frame: &mut ratatui::Frame<'_>, state: &mut WatchState, area: R
     let detail = state.selected().map_or_else(
         || vec![Line::from("No execution selected")],
         |execution| {
+            let relation = if execution.initiator.session_id.as_deref()
+                == Some(state.detail.session.id.as_str())
+            {
+                "current session"
+            } else {
+                "handoff"
+            };
             vec![
                 Line::from(vec![Span::styled(
                     execution.command_display.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(format!("cwd  {}", execution.cwd)),
+                Line::from(format!("source  {relation}")),
                 Line::from(format!(
                     "{}  {}",
                     format_outcome(execution.outcome.as_ref()),
@@ -1013,6 +1027,21 @@ mod tests {
             assert!(text.contains("Output [follow]"));
             assert!(text.contains("cargo test"));
         }
+    }
+
+    #[test]
+    fn renders_cross_session_execution_as_handoff() {
+        let mut linked = execution("linked", ExecutionState::Running);
+        linked.initiator.session_id = Some("other-session".into());
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = WatchState::new(detail(vec![linked]));
+
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("handoff cargo test"));
+        assert!(text.contains("source  handoff"));
     }
 
     #[test]

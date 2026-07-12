@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-agent=${LOOMTERM_DEMO_AGENT:-codex}
-timeout_seconds=${LOOMTERM_DEMO_TIMEOUT_SECONDS:-180}
+timeout_seconds=${LOOMTERM_DEMO_TIMEOUT_SECONDS:-300}
 codex_model=${LOOMTERM_DEMO_CODEX_MODEL:-gpt-5.6-sol}
-
-case "$agent" in
-  codex | claude) ;;
-  *)
-    echo "LOOMTERM_DEMO_AGENT must be codex or claude" >&2
-    exit 2
-    ;;
-esac
 if ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
   echo "LOOMTERM_DEMO_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
 
-for command in "$agent" tmux vhs ffmpeg ffprobe cwebp python3; do
+for command in codex claude tmux vhs ffmpeg ffprobe cwebp python3; do
   command -v "$command" >/dev/null || {
     echo "$command is required" >&2
     exit 2
@@ -25,52 +16,58 @@ for command in "$agent" tmux vhs ffmpeg ffprobe cwebp python3; do
 done
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-root=$(mktemp -d "${TMPDIR:-/tmp}/loomterm-live-demo.XXXXXX")
+root=$(mktemp -d "${TMPDIR:-/tmp}/loomterm-handoff-demo.XXXXXX")
 fixture="$root/fixture"
 bin_dir="$root/bin"
-session=loomterm-live-demo
+tmux_session=loomterm-live-demo
 export LOOMTERM_STATE_DIR="$root/state"
 export LOOMTERM_RUNTIME_DIR="$root/run"
 export LOOMTERM_CONFIG="$root/config.toml"
 controller_pid=
 scroll_pid=
+left=
+right=
 
 cleanup() {
   [[ -z "$controller_pid" ]] || kill "$controller_pid" 2>/dev/null || true
   [[ -z "$scroll_pid" ]] || kill "$scroll_pid" 2>/dev/null || true
-  tmux kill-session -t "$session" 2>/dev/null || true
+  tmux kill-session -t "$tmux_session" 2>/dev/null || true
   "$repo/target/release/loom" daemon stop --force >/dev/null 2>&1 || true
   rm -rf "$root"
 }
 trap cleanup EXIT
 
 diagnose() {
-  echo "demo recording failed; current panes:" >&2
-  tmux capture-pane -p -S -120 -t "$left" 2>/dev/null >&2 || true
-  tmux capture-pane -p -S -120 -t "$right" 2>/dev/null >&2 || true
+  echo "handoff demo recording failed; current panes:" >&2
+  [[ -z "$left" ]] || tmux capture-pane -p -S -160 -t "$left" 2>/dev/null >&2 || true
+  [[ -z "$right" ]] || tmux capture-pane -p -S -160 -t "$right" 2>/dev/null >&2 || true
 }
 
 wait_for_agent_tui() {
+  local agent=$1
   local title_pattern
+  local ready_pattern
   local deadline=$((SECONDS + timeout_seconds))
-  local trust_confirmed=false
+  local screen
 
   if [[ "$agent" == codex ]]; then
     title_pattern='OpenAI Codex'
+    ready_pattern='OpenAI Codex'
   else
     title_pattern='Claude Code'
+    ready_pattern='Try "'
   fi
   while ((SECONDS < deadline)); do
-    screen=$(tmux capture-pane -p -S -120 -t "$left" 2>/dev/null)
-    if [[ "$trust_confirmed" == false ]] \
-      && grep -Eqi 'Do you trust (the contents|the files)' <<<"$screen"; then
-      tmux send-keys -t "$left" Enter
-      trust_confirmed=true
-      sleep 0.25
-      continue
-    fi
-    if grep -Eq "$title_pattern" <<<"$screen"; then
+    screen=$(tmux capture-pane -p -S -160 -t "$left" 2>/dev/null)
+    if grep -Eq "$title_pattern" <<<"$screen" \
+      && grep -Fq "$ready_pattern" <<<"$screen"; then
+      sleep 0.5
       return 0
+    fi
+    if grep -Eqi 'Do you trust (the contents|the files)|Is this a project you created or one you trust' <<<"$screen"; then
+      tmux send-keys -t "$left" Enter
+      sleep 0.5
+      continue
     fi
     sleep 0.25
   done
@@ -78,14 +75,15 @@ wait_for_agent_tui() {
 }
 
 recording_session_id() {
+  local agent=$1
   "$bin_dir/loom" --json session list --workspace live-demo | python3 -c '
 import json, sys
-sessions = json.load(sys.stdin)
-for session in sessions:
-    if session.get("state") == "recording":
+agent = sys.argv[1]
+for session in json.load(sys.stdin):
+    if session.get("state") == "recording" and session.get("agent_kind") == agent:
         print(session["id"])
         break
-'
+' "$agent"
 }
 
 turn_state() {
@@ -103,6 +101,43 @@ print(json.load(sys.stdin)["session"]["state"])
 '
 }
 
+wait_for_session_id() {
+  local agent=$1
+  local id=
+  local deadline=$((SECONDS + timeout_seconds))
+  while [[ -z "$id" ]] && ((SECONDS < deadline)); do
+    id=$(recording_session_id "$agent")
+    [[ -n "$id" ]] || sleep 0.25
+  done
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$id"
+}
+
+wait_for_turn() {
+  local session_id=$1
+  local state=
+  local deadline=$((SECONDS + timeout_seconds))
+  while ((SECONDS < deadline)); do
+    state=$(turn_state "$session_id")
+    if [[ "$state" == completed || "$state" == failed ]]; then
+      printf '%s\n' "$state"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+wait_for_session_end() {
+  local session_id=$1
+  local deadline=$((SECONDS + timeout_seconds))
+  while ((SECONDS < deadline)); do
+    [[ $(session_state "$session_id") != recording ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 stop_interactive_agent() {
   tmux send-keys -l -t "$left" "/exit"
   tmux send-keys -t "$left" Enter
@@ -110,61 +145,133 @@ stop_interactive_agent() {
   tmux send-keys -t "$left" Enter
 }
 
-control_agent() {
-  local session_id=
-  local state=
-  local deadline
+agent_command() {
+  local agent=$1
+  local -a argv
+  if [[ "$agent" == codex ]]; then
+    argv=(
+      codex
+      --yolo
+      --dangerously-bypass-hook-trust
+      --model "$codex_model"
+      -c 'model_reasoning_effort="xhigh"'
+    )
+  else
+    argv=(claude --dangerously-skip-permissions)
+  fi
+  printf '%q ' "${argv[@]}"
+}
 
-  wait_for_agent_tui || {
-    echo "$agent TUI did not become ready" >&2
+start_recording() {
+  local agent=$1
+  local name=$2
+  local delay=$3
+  local command
+  command=$(agent_command "$agent")
+  tmux send-keys -l -t "$left" \
+    "sleep $delay; loom session record --agent $agent --name $name -- $command"
+  tmux send-keys -t "$left" Enter
+}
+
+switch_observer() {
+  tmux send-keys -t "$right" q
+  sleep 1
+  tmux send-keys -t "$right" clear Enter
+  tmux send-keys -l -t "$right" "printf 'PHASE 2  CLAUDE TAKES OVER\\n'; sleep 2; loom watch --active"
+  tmux send-keys -t "$right" Enter
+}
+
+control_handoff() {
+  local source_session
+  local target_session
+  local execution_id
+  local state
+
+  wait_for_agent_tui codex || {
+    echo "Codex TUI did not become ready" >&2
+    return 1
+  }
+  source_session=$(wait_for_session_id codex) || {
+    echo "Codex recording session was not created" >&2
+    return 1
+  }
+  tmux send-keys -l -t "$left" "$source_prompt"
+  tmux send-keys -t "$left" Enter
+  sleep 0.5
+  [[ -n $(turn_state "$source_session") ]] || tmux send-keys -t "$left" Enter
+  state=$(wait_for_turn "$source_session") || {
+    echo "Codex turn did not finish" >&2
+    return 1
+  }
+  [[ "$state" == completed ]] || {
+    echo "Codex turn failed" >&2
+    return 1
+  }
+  execution_id=$("$bin_dir/loom" --json session get "$source_session" | python3 -c '
+import json, sys
+detail = json.load(sys.stdin)
+for execution in detail.get("executions", []):
+    command = execution.get("command", {})
+    if command.get("program") == "python3" and "handoff_worker.py" in command.get("args", []):
+        if execution.get("state") == "running":
+            print(execution["id"])
+            break
+')
+  [[ -n "$execution_id" ]] || {
+    echo "Codex did not leave a running handoff execution" >&2
     return 1
   }
 
-  deadline=$((SECONDS + timeout_seconds))
-  while [[ -z "$session_id" ]] && ((SECONDS < deadline)); do
-    session_id=$(recording_session_id)
-    [[ -n "$session_id" ]] || sleep 0.25
-  done
-  if [[ -z "$session_id" ]]; then
-    echo "Loomterm recording session was not created" >&2
+  sleep 3
+  stop_interactive_agent
+  wait_for_session_end "$source_session" || {
+    echo "Codex session did not exit" >&2
     return 1
-  fi
+  }
+  [[ $("$bin_dir/loom" --json get "$execution_id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])') == running ]] || {
+    echo "handoff execution stopped with the Codex session" >&2
+    return 1
+  }
 
-  tmux send-keys -l -t "$left" "$prompt"
+  tmux send-keys -t "$left" clear Enter
+  tmux send-keys -l -t "$left" "printf 'PHASE 2  CLAUDE TAKES OVER\\n'"
   tmux send-keys -t "$left" Enter
-
-  deadline=$((SECONDS + timeout_seconds))
-  while ((SECONDS < deadline)); do
-    state=$(turn_state "$session_id")
-    if [[ "$state" == completed || "$state" == failed ]]; then
-      break
-    fi
-    sleep 0.5
-  done
-  if [[ "$state" != completed && "$state" != failed ]]; then
-    echo "agent turn did not reach a terminal state" >&2
-    stop_interactive_agent
+  start_recording claude claude-handoff 2
+  wait_for_agent_tui claude || {
+    echo "Claude TUI did not become ready" >&2
     return 1
-  fi
+  }
+  target_session=$(wait_for_session_id claude) || {
+    echo "Claude recording session was not created" >&2
+    return 1
+  }
+  switch_observer
+  tmux send-keys -l -t "$left" "$target_prompt"
+  tmux send-keys -t "$left" Enter
+  sleep 0.5
+  [[ -n $(turn_state "$target_session") ]] || tmux send-keys -t "$left" Enter
+  state=$(wait_for_turn "$target_session") || {
+    echo "Claude turn did not finish" >&2
+    return 1
+  }
+  [[ "$state" == completed ]] || {
+    echo "Claude turn failed" >&2
+    return 1
+  }
+  [[ $("$bin_dir/loom" --json get "$execution_id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])') == cancelled ]] || {
+    echo "Claude did not cancel the handoff execution" >&2
+    return 1
+  }
 
   sleep 4
   stop_interactive_agent
-  deadline=$((SECONDS + timeout_seconds))
-  while ((SECONDS < deadline)); do
-    [[ $(session_state "$session_id") != recording ]] && break
-    sleep 0.25
-  done
-  if [[ $(session_state "$session_id") == recording ]]; then
-    echo "interactive agent did not exit" >&2
+  wait_for_session_end "$target_session" || {
+    echo "Claude session did not exit" >&2
     return 1
-  fi
-  if [[ "$state" == failed ]]; then
-    echo "agent turn failed" >&2
-    return 1
-  fi
+  }
 }
 
-tmux kill-session -t "$session" 2>/dev/null || true
+tmux kill-session -t "$tmux_session" 2>/dev/null || true
 cargo build --manifest-path "$repo/Cargo.toml" --release --bins
 "$repo/scripts/create-demo-fixture.sh" "$fixture" >/dev/null
 mkdir -p "$bin_dir"
@@ -172,49 +279,36 @@ ln -s "$repo/target/release/loom" "$bin_dir/loom"
 ln -s "$repo/target/release/loom-mcp" "$bin_dir/loom-mcp"
 ln -s "$repo/target/release/loomd" "$bin_dir/loomd"
 ln -s "$repo/target/release/loom-supervisor" "$bin_dir/loom-supervisor"
-"$bin_dir/loom" init "$fixture" --name live-demo --agent "$agent" >/dev/null
+"$bin_dir/loom" init "$fixture" --name live-demo --agent both >/dev/null
 printf '\n.codex/\n.claude/\n.mcp.json\n' >> "$fixture/.git/info/exclude"
 
-prompt="Fix the failing outcome-classification test in this small repository. Keep the public return shape and test unchanged. Use Loomterm MCP tools for every shell command: inspect the files, run the focused test, and finish with a diff check. Do not use the shell tool. Keep the final answer brief."
-if [[ "$agent" == codex ]]; then
-  agent_argv=(
-    codex
-    --yolo
-    --dangerously-bypass-hook-trust
-    --model "$codex_model"
-    -c 'model_reasoning_effort="xhigh"'
-  )
-else
-  agent_argv=(claude --dangerously-skip-permissions)
-fi
-printf -v agent_command ' %q' "${agent_argv[@]}"
+source_prompt="Start the long-running handoff worker with Loomterm MCP using program python3 and args -u handoff_worker.py. Set wait_ms=1000. Once loom_run returns a running execution, report its full execution ID and stop. Do not wait for it, cancel it, or use the shell tool. Keep the final answer brief."
+target_prompt="A previous Codex session left a Loomterm execution running in this workspace. Use Loomterm MCP only: call loom_list to find the running python3 -u handoff_worker.py execution, use loom_read to inspect its existing progress, cancel that same execution with loom_cancel, then use loom_get or loom_wait to verify its state is cancelled. Do not use the shell tool or start another execution. Include the full execution ID in the final answer."
 
-tmux new-session -d -x 160 -y 48 -s "$session" -n demo
-tmux set-option -t "$session" remain-on-exit on
-left=$(tmux display-message -p -t "$session":demo '#{pane_id}')
+tmux new-session -d -x 160 -y 48 -s "$tmux_session" -n demo
+tmux set-option -t "$tmux_session" remain-on-exit on
+left=$(tmux display-message -p -t "$tmux_session":demo '#{pane_id}')
 right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
 setup="cd '$fixture' && export PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' && clear"
-record_command="sleep 3; loom session record --agent $agent --name $agent-outcome-fix --$agent_command"
 
 tmux send-keys -t "$left" "$setup" Enter
-tmux send-keys -l -t "$left" "$record_command"
-tmux send-keys -t "$left" Enter
+start_recording codex codex-starts-worker 3
 tmux send-keys -t "$right" "$setup" Enter
 tmux send-keys -t "$right" "sleep 3.5; loom watch --active" Enter
+tmux select-layout -t "$tmux_session":demo even-horizontal >/dev/null
 
-tmux select-layout -t "$session":demo even-horizontal >/dev/null
 (
   rc=0
-  control_agent || rc=$?
-  tmux detach-client -s "$session" 2>/dev/null || true
+  control_handoff || rc=$?
+  tmux detach-client -s "$tmux_session" 2>/dev/null || true
   exit "$rc"
 ) &
 controller_pid=$!
 (
-  sleep 15
-  while tmux has-session -t "$session" 2>/dev/null; do
-    tmux send-keys -t "$right" Down Down Down Down Down
-    sleep 9
+  sleep 12
+  while tmux has-session -t "$tmux_session" 2>/dev/null; do
+    tmux send-keys -t "$right" Down Down Down
+    sleep 8
   done
 ) &
 scroll_pid=$!
@@ -239,58 +333,71 @@ if ! wait "$controller_pid"; then
   exit 1
 fi
 controller_pid=
-for ((attempt = 0; attempt < timeout_seconds; attempt++)); do
-  if ! "$bin_dir/loom" session list --workspace live-demo | grep -q recording; then
-    break
-  fi
-  sleep 1
-done
-if "$bin_dir/loom" session list --workspace live-demo | grep -q recording; then
-  diagnose
-  echo "recording session did not finish" >&2
-  exit 1
-fi
 
-session_id=$("$bin_dir/loom" --json session list --workspace live-demo | python3 -c '
+sessions_json="$root/sessions.json"
+"$bin_dir/loom" --json session list --workspace live-demo > "$sessions_json"
+source_session=$(python3 - "$sessions_json" <<'PY'
 import json, sys
-sessions = json.load(sys.stdin)
-if sessions:
-    print(sessions[0]["id"])
-')
-if [[ -z "$session_id" ]]; then
-  echo "recorded session was not found" >&2
+for session in json.load(open(sys.argv[1], encoding="utf-8")):
+    if session.get("agent_kind") == "codex":
+        print(session["id"])
+        break
+PY
+)
+target_session=$(python3 - "$sessions_json" <<'PY'
+import json, sys
+for session in json.load(open(sys.argv[1], encoding="utf-8")):
+    if session.get("agent_kind") == "claude":
+        print(session["id"])
+        break
+PY
+)
+[[ -n "$source_session" && -n "$target_session" ]] || {
+  echo "both handoff sessions were not found" >&2
   exit 1
-fi
-detail_json="$root/session.json"
-"$bin_dir/loom" --json session get "$session_id" > "$detail_json"
-python3 - "$detail_json" "$prompt" <<'PY'
+}
+source_json="$root/source.json"
+target_json="$root/target.json"
+"$bin_dir/loom" --json session get "$source_session" > "$source_json"
+"$bin_dir/loom" --json session get "$target_session" > "$target_json"
+python3 - "$source_json" "$target_json" "$source_prompt" "$target_prompt" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as stream:
-    detail = json.load(stream)
-prompt = sys.argv[2]
-assert detail["session"]["state"] == "finished", detail["session"]["state"]
-assert any(turn["state"] == "completed" and turn["prompt"] == prompt for turn in detail["turns"])
-assert detail["actions"], "no structured agent actions were captured"
-assert detail["executions"], "no Loomterm executions were correlated"
+source = json.load(open(sys.argv[1], encoding="utf-8"))
+target = json.load(open(sys.argv[2], encoding="utf-8"))
+source_prompt, target_prompt = sys.argv[3:]
+assert source["session"]["state"] == "finished"
+assert target["session"]["state"] == "finished"
+assert any(turn["state"] == "completed" and turn["prompt"] == source_prompt for turn in source["turns"])
+assert any(turn["state"] == "completed" and turn["prompt"] == target_prompt for turn in target["turns"])
+assert len(source["executions"]) == 1
+execution = source["executions"][0]
+assert execution["state"] == "cancelled"
+assert execution["initiator"]["session_id"] == source["session"]["id"]
+linked = [item for item in target["executions"] if item["id"] == execution["id"]]
+assert len(linked) == 1
+assert linked[0]["state"] == "cancelled"
+assert any(action.get("execution_id") == execution["id"] for action in target["actions"])
+assert source["session"]["ended_at_ms"] <= target["session"]["created_at_ms"]
+print(execution["id"])
 PY
 
-(cd "$fixture" && python3 -m unittest -q)
 status=$(git -C "$fixture" status --short)
-if [[ "$status" != " M session_report.py" ]]; then
+if [[ -n "$status" ]]; then
   echo "unexpected fixture changes:" >&2
   printf '%s\n' "$status" >&2
   exit 1
 fi
 
-cp "$LOOMTERM_STATE_DIR/sessions/$session_id/replay.html" "$root/replay.html"
+cp "$LOOMTERM_STATE_DIR/sessions/$source_session/replay.html" "$root/replay-codex.html"
+cp "$LOOMTERM_STATE_DIR/sessions/$target_session/replay.html" "$root/replay.html"
 poster_png="$root/poster.png"
 duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$root/demo.mp4")
 poster_at=$(python3 - "$duration" <<'PY'
 import sys
 duration = float(sys.argv[1])
-print(max(1.0, min(duration - 1.0, duration * 0.55)))
+print(max(1.0, min(duration - 1.0, duration * 0.82)))
 PY
 )
 ffmpeg -y -ss "$poster_at" -i "$root/demo.mp4" -frames:v 1 -vf 'scale=1600:-2' "$poster_png" \
@@ -299,4 +406,5 @@ cwebp -quiet -q 82 "$poster_png" -o "$root/poster.webp"
 cp "$root/demo.mp4" "$repo/docs/demo.mp4"
 cp "$root/poster.webp" "$repo/docs/poster.webp"
 cp "$root/replay.html" "$repo/docs/replay.html"
-echo "recorded docs/demo.mp4 and docs/poster.webp"
+cp "$root/replay-codex.html" "$repo/docs/replay-codex.html"
+echo "recorded Codex-to-Claude handoff demo"

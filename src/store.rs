@@ -1284,8 +1284,8 @@ impl Database {
                 let execution_id = execution_id.as_deref().filter(|execution_id| {
                     connection
                         .query_row(
-                            "SELECT 1 FROM executions WHERE id = ?1 AND session_id = ?2",
-                            params![execution_id, request.session_id],
+                            "SELECT 1 FROM executions WHERE id = ?1 AND workspace_id = ?2",
+                            params![execution_id, session.workspace_id],
                             |_| Ok(()),
                         )
                         .optional()
@@ -1339,7 +1339,13 @@ impl Database {
             "SELECT id, workspace_id, state, command_json, cwd, env_keys_json,
                 initiator_json, created_at_ms, started_at_ms, ended_at_ms, pid, pgid,
                 outcome_json, captured_bytes, output_truncated, last_seq
-             FROM executions WHERE session_id = ?1 ORDER BY created_at_ms",
+             FROM executions
+             WHERE session_id = ?1 OR id IN (
+                SELECT a.execution_id
+                FROM agent_actions a JOIN agent_turns t ON t.id = a.turn_id
+                WHERE t.session_id = ?1 AND a.execution_id IS NOT NULL
+             )
+             ORDER BY created_at_ms",
         )?;
         let executions = statement
             .query_map([id], execution_from_row)?
@@ -2327,6 +2333,108 @@ mod tests {
                 .session_id,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn links_referenced_executions_across_sessions_in_one_workspace() {
+        let root = tempdir().unwrap();
+        let other_root = tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let workspace = store.add_workspace("test", root.path()).await.unwrap();
+        let other_workspace = store
+            .add_workspace("other", other_root.path())
+            .await
+            .unwrap();
+        let source_id = new_id();
+        let target_id = new_id();
+        for (id, agent) in [(&source_id, "codex"), (&target_id, "claude")] {
+            store
+                .create_agent_session(&AgentSessionRequest {
+                    id: id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    agent_kind: agent.into(),
+                    name: Some(format!("{agent} handoff")),
+                    command: CommandSpec::Argv {
+                        program: agent.into(),
+                        args: Vec::new(),
+                    },
+                    cwd: root.path().to_string_lossy().into_owned(),
+                    recorder_pid: 42,
+                    initial_cols: 80,
+                    initial_rows: 24,
+                    cast_path: root
+                        .path()
+                        .join(format!("{agent}.cast"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    html_path: root
+                        .path()
+                        .join(format!("{agent}.html"))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut source_request = request(workspace.id.clone());
+        source_request.initiator.session_id = Some(source_id.clone());
+        let execution = store
+            .create_execution(&source_request, root.path())
+            .await
+            .unwrap();
+        let outside = store
+            .create_execution(&request(other_workspace.id), other_root.path())
+            .await
+            .unwrap();
+        store
+            .finish_agent_session(
+                &source_id,
+                AgentSessionFinish {
+                    state: AgentSessionState::Finished,
+                    outcome: ExecutionOutcome::Exited { code: 0 },
+                    captured_bytes: 0,
+                    output_truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let target_event = |action_id: &str, execution_id: Option<String>| AgentEventRequest {
+            session_id: target_id.clone(),
+            provider: "claude".into(),
+            provider_session_id: "claude-session".into(),
+            provider_turn_id: None,
+            event: AgentEvent::ToolFinished {
+                action_id: action_id.into(),
+                tool_name: "mcp__loomterm__loom_wait".into(),
+                failed: false,
+                execution_id,
+            },
+        };
+        store
+            .record_agent_event(&target_event("handoff", Some(execution.id.clone())))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&target_event("outside", Some(outside.id.clone())))
+            .await
+            .unwrap();
+
+        let source = store.get_agent_session(&source_id).await.unwrap();
+        assert_eq!(source.executions.len(), 1);
+        let target = store.get_agent_session(&target_id).await.unwrap();
+        assert_eq!(target.executions.len(), 1);
+        assert_eq!(target.executions[0].id, execution.id);
+        assert_eq!(target.actions.len(), 2);
+        assert_eq!(target.actions[0].execution_id, Some(execution.id.clone()));
+        assert_eq!(target.actions[1].execution_id, None);
+
+        store.delete_agent_session(&source_id).await.unwrap();
+        let target = store.get_agent_session(&target_id).await.unwrap();
+        assert_eq!(target.executions.len(), 1);
+        assert_eq!(target.executions[0].id, execution.id);
+        assert_eq!(target.executions[0].initiator.session_id, None);
     }
 
     #[tokio::test]

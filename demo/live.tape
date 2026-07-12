@@ -1,5 +1,3 @@
-Output docs/demo.mp4
-
 Require tmux
 
 Set Shell "zsh"
@@ -12,10 +10,8 @@ Set Theme { "name": "Loomterm", "black": "#111418", "red": "#ff6b6b", "green": "
 Set Padding 12
 Set Framerate 30
 Set TypingSpeed 15ms
+Set WaitTimeout 180s
 
-Type "tmux attach -t loomterm-live-demo"
+Type "tmux attach -t loomterm-live-demo; sleep 1; printf '\\nLOOMTERM_DEMO_%s\\n' COMPLETE; sleep 2"
 Enter
-Sleep 50s
-Ctrl+b
-Type "d"
-Sleep 1s
+Wait /LOOMTERM_DEMO_COMPLETE/

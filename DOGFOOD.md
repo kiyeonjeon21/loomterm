@@ -202,7 +202,7 @@ running. Claude Code then lists that same execution, reads its accumulated
 checkpoints, cancels it, and verifies the `cancelled` state without starting a
 replacement process or using a shell tool.
 
-The 46-second capture and both HTML replays passed automated assertions for the
+The 60-second capture and both HTML replays passed automated assertions for the
 exact prompts, completed turns, shared execution ID, source-session ownership,
 target-session action link, final state, session ordering, and a clean fixture
 worktree. Store validation rejects an execution link from another workspace;

@@ -17,7 +17,7 @@ LLM client.
 
 [![Codex-to-Claude execution handoff recorded by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
 
-[Watch the 46-second Codex-to-Claude handoff](https://kiyeonjeon21.github.io/loomterm/demo.mp4),
+[Watch the 60-second Codex-to-Claude handoff](https://kiyeonjeon21.github.io/loomterm/demo.mp4),
 [explore Claude's takeover replay](https://kiyeonjeon21.github.io/loomterm/replay.html),
 or [inspect the originating Codex replay](https://kiyeonjeon21.github.io/loomterm/replay-codex.html).
 In the real interactive capture, `codex --yolo` starts a long-running worker and

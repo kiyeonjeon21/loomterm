@@ -6,16 +6,17 @@ use std::time::Duration;
 use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use loomterm::agent::{
-    MAX_HOOK_INPUT_BYTES, hook_cwd, normalize_hook_event, select_active_session_id,
+    MAX_HOOK_INPUT_BYTES, STRICT_SHELL_ROUTING_ENV, hook_cwd, normalize_hook_event,
+    select_active_session_id, strict_shell_routing_response,
 };
 use loomterm::client::DaemonClient;
 use loomterm::config::{AppPaths, Settings};
 use loomterm::model::{
-    AgentSessionFinish, AgentSessionRequest, AgentSessionState, CommandSpec, Execution,
-    ExecutionEvent, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest, ExecutionStats,
-    Initiator, new_id, now_ms,
+    AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, AgentSessionState, CommandSpec,
+    Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest,
+    ExecutionStats, Initiator, new_id, now_ms,
 };
-use loomterm::onboarding::{AgentSelection, InitPlan};
+use loomterm::onboarding::{AgentSelection, ConfigAction, InitPlan};
 use loomterm::session::{
     RecordSpec, SessionArtifacts, export_cast, open_html, record, terminal_size, write_replay_html,
 };
@@ -59,6 +60,10 @@ enum Commands {
     Stats(StatsArgs),
     /// Observe a recorded agent session and its structured executions live.
     Watch(WatchArgs),
+    /// Launch Codex or Claude Code with recording and durable shell routing.
+    Agent(AgentLaunchArgs),
+    /// Launch an agent with context from a previous session's active executions.
+    Handoff(HandoffArgs),
     #[command(subcommand)]
     Session(SessionCommand),
     #[command(subcommand)]
@@ -72,6 +77,56 @@ enum Commands {
 struct AgentEventArgs {
     #[arg(long, value_enum)]
     provider: AgentProviderArg,
+}
+
+#[derive(Debug, Args)]
+struct AgentLaunchArgs {
+    #[arg(value_enum)]
+    provider: AgentProviderArg,
+    #[arg(short, long)]
+    workspace: Option<String>,
+    #[arg(short, long)]
+    name: Option<String>,
+    #[arg(long)]
+    capture_limit_bytes: Option<u64>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(
+        long,
+        help = "Allow the provider's native Bash tool instead of requiring Loomterm"
+    )]
+    allow_native_shell: bool,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "AGENT_ARGS"
+    )]
+    agent_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct HandoffArgs {
+    #[arg(value_enum)]
+    provider: AgentProviderArg,
+    #[arg(short, long)]
+    workspace: Option<String>,
+    #[arg(long, value_name = "SESSION_ID")]
+    from: Option<String>,
+    #[arg(short, long)]
+    name: Option<String>,
+    #[arg(long)]
+    capture_limit_bytes: Option<u64>,
+    #[arg(
+        long,
+        help = "Allow the provider's native Bash tool instead of requiring Loomterm"
+    )]
+    allow_native_shell: bool,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "AGENT_ARGS"
+    )]
+    agent_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -397,6 +452,8 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Commands::Watch(args) => watch_session(&client, args, cli.json).await,
+        Commands::Agent(args) => launch_agent(&client, &paths, args, cli.json).await,
+        Commands::Handoff(args) => launch_handoff(&client, &paths, args, cli.json).await,
         Commands::Session(command) => handle_session(&client, &paths, command, cli.json).await,
         Commands::Daemon(command) => {
             match command {
@@ -471,6 +528,14 @@ async fn record_agent_hook_event(provider: AgentProviderArg) {
         hook_log("hook input was not valid JSON");
         return;
     };
+    if std::env::var(STRICT_SHELL_ROUTING_ENV).as_deref() == Ok("strict")
+        && let Some(response) = strict_shell_routing_response(&input)
+    {
+        if serde_json::to_writer(std::io::stdout(), &response).is_err() {
+            hook_log("could not write strict shell routing response");
+        }
+        return;
+    }
     let Ok(paths) = AppPaths::discover() else {
         hook_log("could not discover Loomterm paths");
         return;
@@ -752,11 +817,268 @@ async fn handle_session(
     }
 }
 
+async fn launch_agent(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    args: AgentLaunchArgs,
+    json: bool,
+) -> Result<i32> {
+    let workspace = selected_workspace(client, args.workspace.as_deref()).await?;
+    ensure_agent_integration(&workspace.root, args.provider)?;
+    let mut argv = vec![args.provider.as_str().to_owned()];
+    argv.extend(args.agent_args);
+    if let Some(prompt) = args.prompt {
+        if prompt.trim().is_empty() {
+            return Err(Error::InvalidRequest("--prompt must not be empty".into()));
+        }
+        argv.push(prompt);
+    }
+    let env = routing_environment(args.allow_native_shell);
+    record_session_with_env(
+        client,
+        paths,
+        SessionRecordArgs {
+            workspace: Some(workspace.id),
+            name: args.name,
+            agent: provider_kind(args.provider),
+            capture_limit_bytes: args.capture_limit_bytes,
+            argv,
+        },
+        json,
+        env,
+    )
+    .await
+}
+
+async fn launch_handoff(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    args: HandoffArgs,
+    json: bool,
+) -> Result<i32> {
+    let workspace = selected_workspace(client, args.workspace.as_deref()).await?;
+    ensure_agent_integration(&workspace.root, args.provider)?;
+    let source = select_handoff_source(client, &workspace.id, args.from.as_deref()).await?;
+    let prompt = build_handoff_prompt(&source);
+    let mut argv = vec![args.provider.as_str().to_owned()];
+    argv.extend(args.agent_args);
+    argv.push(prompt);
+    let name = args.name.or_else(|| {
+        Some(format!(
+            "handoff-{}-to-{}",
+            short_id(&source.session.id),
+            args.provider.as_str()
+        ))
+    });
+    let env = routing_environment(args.allow_native_shell);
+    record_session_with_env(
+        client,
+        paths,
+        SessionRecordArgs {
+            workspace: Some(workspace.id),
+            name,
+            agent: provider_kind(args.provider),
+            capture_limit_bytes: args.capture_limit_bytes,
+            argv,
+        },
+        json,
+        env,
+    )
+    .await
+}
+
+fn routing_environment(allow_native_shell: bool) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        STRICT_SHELL_ROUTING_ENV.into(),
+        if allow_native_shell {
+            "native".into()
+        } else {
+            "strict".into()
+        },
+    )])
+}
+
+fn provider_kind(provider: AgentProviderArg) -> AgentKindArg {
+    match provider {
+        AgentProviderArg::Codex => AgentKindArg::Codex,
+        AgentProviderArg::Claude => AgentKindArg::Claude,
+    }
+}
+
+async fn selected_workspace(
+    client: &DaemonClient,
+    requested: Option<&str>,
+) -> Result<loomterm::model::Workspace> {
+    let identifier = resolve_workspace(client, requested).await?;
+    client
+        .list_workspaces()
+        .await?
+        .into_iter()
+        .find(|workspace| workspace.id == identifier || workspace.name == identifier)
+        .ok_or_else(|| Error::WorkspaceNotFound(identifier))
+}
+
+fn ensure_agent_integration(root: &str, provider: AgentProviderArg) -> Result<()> {
+    let selection = match provider {
+        AgentProviderArg::Codex => AgentSelection {
+            codex: true,
+            claude: false,
+        },
+        AgentProviderArg::Claude => AgentSelection {
+            codex: false,
+            claude: true,
+        },
+    };
+    let plan =
+        loomterm::onboarding::plan(Path::new(root), None, selection, false).map_err(|error| {
+            Error::Config(format!(
+                "{} integration is not ready: {error}; run `loom init --agent {}`",
+                provider.as_str(),
+                provider.as_str()
+            ))
+        })?;
+    let ready = match provider {
+        AgentProviderArg::Codex => {
+            plan.codex.action == ConfigAction::Unchanged
+                && plan.codex_hooks.action == ConfigAction::Unchanged
+        }
+        AgentProviderArg::Claude => {
+            plan.claude.action == ConfigAction::Unchanged
+                && plan.claude_hooks.action == ConfigAction::Unchanged
+        }
+    };
+    if ready {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "{} integration is not initialized; run `loom init --agent {}`",
+            provider.as_str(),
+            provider.as_str()
+        )))
+    }
+}
+
+async fn select_handoff_source(
+    client: &DaemonClient,
+    workspace_id: &str,
+    requested: Option<&str>,
+) -> Result<AgentSessionDetail> {
+    if let Some(session_id) = requested {
+        let detail = client.get_agent_session(session_id.to_owned()).await?;
+        validate_handoff_source(detail, workspace_id)
+    } else {
+        let sessions = client
+            .list_agent_sessions(Some(workspace_id.to_owned()), 100)
+            .await?;
+        for session in sessions {
+            if session.state == AgentSessionState::Recording {
+                continue;
+            }
+            let detail = client.get_agent_session(session.id).await?;
+            if has_active_executions(&detail) {
+                return Ok(detail);
+            }
+        }
+        Err(Error::InvalidRequest(
+            "no finished session with queued or running executions is available; use `loom agent` to start a new session"
+                .into(),
+        ))
+    }
+}
+
+fn validate_handoff_source(
+    detail: AgentSessionDetail,
+    workspace_id: &str,
+) -> Result<AgentSessionDetail> {
+    if detail.session.workspace_id != workspace_id {
+        return Err(Error::InvalidRequest(
+            "handoff source belongs to a different workspace".into(),
+        ));
+    }
+    if detail.session.state == AgentSessionState::Recording {
+        return Err(Error::InvalidRequest(
+            "handoff source is still recording; exit the source agent first".into(),
+        ));
+    }
+    if !has_active_executions(&detail) {
+        return Err(Error::InvalidRequest(
+            "handoff source has no queued or running executions".into(),
+        ));
+    }
+    Ok(detail)
+}
+
+fn has_active_executions(detail: &AgentSessionDetail) -> bool {
+    detail
+        .executions
+        .iter()
+        .any(|execution| !execution.state.is_terminal())
+}
+
+fn build_handoff_prompt(detail: &AgentSessionDetail) -> String {
+    let latest_turn = detail.turns.iter().max_by_key(|turn| turn.created_at_ms);
+    let mut prompt = format!(
+        "Take over durable Loomterm work from the previous {} session {}. Use Loomterm MCP for all execution operations. First call loom_list, then call loom_read for each listed execution to verify its current state and existing output. Do not start a replacement, cancel an execution, or use native Bash before inspecting it. After inspection, continue the original goal based on the current evidence.\n\nSource session: {}\n",
+        detail.session.agent_kind,
+        detail.session.id,
+        detail
+            .session
+            .name
+            .as_deref()
+            .unwrap_or(&detail.session.command_display)
+    );
+    if let Some(turn) = latest_turn {
+        prompt.push_str("Original request: ");
+        prompt.push_str(&bounded_text(&turn.prompt, 4_000));
+        prompt.push('\n');
+        if let Some(message) = &turn.last_assistant_message {
+            prompt.push_str("Previous assistant status: ");
+            prompt.push_str(&bounded_text(message, 4_000));
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str("\nActive executions:\n");
+    for execution in detail
+        .executions
+        .iter()
+        .filter(|execution| !execution.state.is_terminal())
+    {
+        prompt.push_str(&format!(
+            "- {} | {} | cwd={} | {}\n",
+            execution.id,
+            execution.state.as_str(),
+            bounded_text(&execution.cwd, 1_000),
+            bounded_text(&execution.command_display, 2_000)
+        ));
+    }
+    prompt
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
 async fn record_session(
     client: &DaemonClient,
     paths: &AppPaths,
     args: SessionRecordArgs,
     json: bool,
+) -> Result<i32> {
+    record_session_with_env(client, paths, args, json, BTreeMap::new()).await
+}
+
+async fn record_session_with_env(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    args: SessionRecordArgs,
+    json: bool,
+    env: BTreeMap<String, String>,
 ) -> Result<i32> {
     if json {
         return Err(Error::InvalidRequest(
@@ -806,6 +1128,7 @@ async fn record_session(
         initial_cols,
         initial_rows,
         capture_limit_bytes,
+        env,
     };
     let result = tokio::task::spawn_blocking(move || record(spec))
         .await
@@ -1190,7 +1513,9 @@ fn format_duration(value: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use loomterm::model::{ExecutionStats, ExecutionStatusCounts, InitiatorStats, Workspace};
+    use loomterm::model::{
+        AgentSessionDetail, ExecutionStats, ExecutionStatusCounts, InitiatorStats, Workspace,
+    };
 
     use super::*;
 
@@ -1236,5 +1561,143 @@ mod tests {
         assert_eq!(format_duration(None), "n/a");
         assert_eq!(format_bytes(0), "0 bytes");
         assert_eq!(format_bytes(1023), "1023 bytes");
+    }
+
+    #[test]
+    fn handoff_prompt_includes_context_but_not_execution_output() {
+        let detail = handoff_detail("finished", "running");
+        let prompt = build_handoff_prompt(&detail);
+        assert!(prompt.contains("previous codex session source-session"));
+        assert!(prompt.contains("Original request: Keep the worker alive"));
+        assert!(prompt.contains("Previous assistant status: Worker is still running"));
+        assert!(prompt.contains("execution-1 | running | cwd=/tmp/project"));
+        assert!(prompt.contains("python3 worker.py"));
+        assert!(!prompt.contains("secret worker output"));
+        assert!(validate_handoff_source(detail, "workspace").is_ok());
+    }
+
+    #[test]
+    fn handoff_source_must_be_stopped_with_active_work() {
+        assert!(
+            validate_handoff_source(handoff_detail("recording", "running"), "workspace")
+                .unwrap_err()
+                .to_string()
+                .contains("still recording")
+        );
+        assert!(
+            validate_handoff_source(handoff_detail("finished", "finished"), "workspace")
+                .unwrap_err()
+                .to_string()
+                .contains("no queued or running")
+        );
+        assert!(
+            validate_handoff_source(handoff_detail("finished", "running"), "other")
+                .unwrap_err()
+                .to_string()
+                .contains("different workspace")
+        );
+    }
+
+    #[test]
+    fn handoff_context_is_bounded_on_character_boundaries() {
+        let value = format!("{}tail", "한".repeat(4_000));
+        let bounded = bounded_text(&value, 4_000);
+        assert!(bounded.ends_with("..."));
+        assert_eq!(bounded.chars().count(), 4_003);
+    }
+
+    #[test]
+    fn parses_agent_and_handoff_launchers_with_forwarded_arguments() {
+        let agent =
+            Cli::try_parse_from(["loom", "agent", "--name", "work", "codex", "--", "--yolo"])
+                .unwrap();
+        let Commands::Agent(args) = agent.command else {
+            panic!("expected agent command");
+        };
+        assert!(matches!(args.provider, AgentProviderArg::Codex));
+        assert_eq!(args.name.as_deref(), Some("work"));
+        assert_eq!(args.agent_args, ["--yolo"]);
+
+        let handoff = Cli::try_parse_from([
+            "loom", "handoff", "--from", "source", "claude", "--", "--model", "sonnet",
+        ])
+        .unwrap();
+        let Commands::Handoff(args) = handoff.command else {
+            panic!("expected handoff command");
+        };
+        assert!(matches!(args.provider, AgentProviderArg::Claude));
+        assert_eq!(args.from.as_deref(), Some("source"));
+        assert_eq!(args.agent_args, ["--model", "sonnet"]);
+    }
+
+    #[test]
+    fn launcher_explicitly_selects_strict_or_native_shell_routing() {
+        assert_eq!(
+            routing_environment(false).get(STRICT_SHELL_ROUTING_ENV),
+            Some(&"strict".to_owned())
+        );
+        assert_eq!(
+            routing_environment(true).get(STRICT_SHELL_ROUTING_ENV),
+            Some(&"native".to_owned())
+        );
+    }
+
+    fn handoff_detail(session_state: &str, execution_state: &str) -> AgentSessionDetail {
+        serde_json::from_value(serde_json::json!({
+            "session": {
+                "id": "source-session",
+                "workspace_id": "workspace",
+                "state": session_state,
+                "agent_kind": "codex",
+                "name": "source",
+                "command": {"kind": "argv", "program": "codex", "args": []},
+                "command_display": "codex",
+                "cwd": "/tmp/project",
+                "created_at_ms": 1,
+                "ended_at_ms": 2,
+                "duration_ms": 1,
+                "recorder_pid": 1,
+                "outcome": {"kind": "exited", "code": 0},
+                "captured_bytes": 0,
+                "output_truncated": false,
+                "initial_cols": 80,
+                "initial_rows": 24,
+                "cast_path": "recording.cast",
+                "html_path": "replay.html"
+            },
+            "executions": [{
+                "id": "execution-1",
+                "workspace_id": "workspace",
+                "state": execution_state,
+                "command": {"kind": "argv", "program": "python3", "args": ["worker.py"]},
+                "command_display": "python3 worker.py",
+                "cwd": "/tmp/project",
+                "env_keys": [],
+                "initiator": {"kind": "mcp", "name": "loomterm", "session_id": "source-session"},
+                "created_at_ms": 1,
+                "started_at_ms": 1,
+                "ended_at_ms": null,
+                "duration_ms": null,
+                "pid": 123,
+                "pgid": 123,
+                "outcome": null,
+                "captured_bytes": 20,
+                "output_truncated": false,
+                "last_seq": 2
+            }],
+            "turns": [{
+                "id": "turn-1",
+                "session_id": "source-session",
+                "provider": "codex",
+                "provider_session_id": "provider-session",
+                "state": "completed",
+                "prompt": "Keep the worker alive",
+                "created_at_ms": 1,
+                "ended_at_ms": 2,
+                "last_assistant_message": "Worker is still running"
+            }],
+            "actions": []
+        }))
+        .unwrap()
     }
 }

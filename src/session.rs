@@ -1,5 +1,6 @@
 //! Interactive agent session recording and replay export.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -55,6 +56,7 @@ pub struct RecordSpec {
     pub initial_cols: u16,
     pub initial_rows: u16,
     pub capture_limit_bytes: u64,
+    pub env: BTreeMap<String, String>,
 }
 
 pub struct RecordResult {
@@ -101,6 +103,9 @@ pub fn record(spec: RecordSpec) -> Result<RecordResult> {
     command.cwd(&spec.cwd);
     command.env("LOOMTERM_SESSION_ID", &spec.session_id);
     command.env("LOOMTERM_AGENT_KIND", &spec.agent_kind);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
     let child = pair
         .slave
         .spawn_command(command)

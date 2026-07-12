@@ -17,13 +17,14 @@ LLM client.
 
 [![Codex-to-Claude execution handoff recorded by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
 
-[Watch the 60-second Codex-to-Claude handoff](https://kiyeonjeon21.github.io/loomterm/demo.mp4),
+[Watch the 80-second Codex-to-Claude handoff](https://kiyeonjeon21.github.io/loomterm/demo.mp4),
 [explore Claude's takeover replay](https://kiyeonjeon21.github.io/loomterm/replay.html),
 or [inspect the originating Codex replay](https://kiyeonjeon21.github.io/loomterm/replay-codex.html).
-In the real interactive capture, `codex --yolo` starts a long-running worker and
-exits. The worker stays alive; Claude Code discovers the same execution ID,
-reads its existing output, cancels it, and verifies the terminal state. The
-observer labels that cross-session execution as a handoff.
+In the real interactive capture, `loom agent codex` starts a long-running worker
+without the user naming an MCP tool, then exits. The worker stays alive;
+`loom handoff claude` supplies the original request and execution metadata,
+Claude reads the existing output, cancels the same execution, and verifies its
+terminal state. The observer labels that cross-session execution as a handoff.
 
 ## What it provides
 
@@ -37,6 +38,7 @@ observer labels that cross-session execution as a handoff.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
 - An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
 - Provider-neutral agent turn records populated by Codex and Claude Code lifecycle hooks.
+- Recorded Codex/Claude launchers with opt-in strict shell routing and local handoff context.
 - A responsive terminal observer for live session and execution state.
 - Self-contained HTML and asciicast exports correlated with Loomterm executions.
 
@@ -122,10 +124,46 @@ When `--workspace` is omitted, `loom stats` selects the most specific registered
 workspace containing the current directory. Statistics are derived from the
 existing local SQLite execution records; Loomterm does not send usage telemetry.
 
+## Agent launch and handoff
+
+After initializing a project, launch an agent through Loomterm:
+
+```sh
+loom init . --agent both
+loom agent codex -- --yolo
+```
+
+`loom agent` records the real interactive TUI and enables strict shell routing.
+When Codex or Claude Code attempts native Bash, the project hook denies that
+attempt and tells the agent to retry the same operation with `loom_run`. It does
+not rewrite or auto-approve the command. Non-Bash tools remain available.
+
+Exit the source agent after it leaves a queued or running execution, then start
+the next agent:
+
+```sh
+loom handoff claude -- --dangerously-skip-permissions
+```
+
+By default, `handoff` selects the newest finished or interrupted session in the
+current workspace that still references active work. Use `--from SESSION_ID` to
+select one explicitly. The generated first prompt includes the source request,
+last assistant status, and active execution metadata; it does not copy command
+output. The target agent calls `loom_list` and `loom_read` before deciding
+whether to wait, cancel, or continue the original goal. If no active work is
+available, the command exits instead of silently starting an unrelated session.
+
+Loomterm's execution API is pipe-based. For a provider session that must run a
+native interactive or PTY-dependent shell command, opt out explicitly:
+
+```sh
+loom agent --allow-native-shell codex
+```
+
 ## Agent session recording
 
 Record an existing interactive agent from startup to exit without installing a
-GUI terminal:
+GUI terminal or enabling strict routing:
 
 ```sh
 loom session record --name feature-demo -- codex
@@ -208,17 +246,19 @@ codex mcp get loomterm --json
 
 Codex requires project-local hooks to be reviewed and trusted; use `/hooks`
 after opening the trusted project. Claude Code loads the project settings using
-its normal settings trust flow. The generated handlers are silent observers:
-they read provider JSON from stdin, prefer `LOOMTERM_SESSION_ID`, otherwise
-match the hook `cwd` and provider to an active recording, and never return a
-tool or prompt decision. See the official
+its normal settings trust flow. Outside `loom agent` and `loom handoff`, the
+generated handlers are silent observers. Inside those launchers, their
+`PreToolUse` handler denies native Bash so the agent retries through Loomterm;
+the hook never rewrites or auto-approves the command. All handlers prefer
+`LOOMTERM_SESSION_ID`, otherwise matching the hook `cwd` and provider to an
+active recording. See the official
 [Codex hooks guide](https://learn.chatgpt.com/docs/hooks) and
 [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
-Lifecycle hooks are an additive observation channel, not the execution source
-of truth. In particular, current Codex hooks do not intercept every unified
-shell or non-shell call. Loomterm executions remain authoritative because
-`loomd` owns those processes directly.
+Lifecycle hooks provide correlation and the launcher-specific routing decision,
+not process ownership. Loomterm executions remain authoritative because `loomd`
+owns those processes directly. Non-Bash tools and sessions launched outside the
+Loomterm launcher are not routed.
 
 The MCP server exposes:
 
@@ -327,6 +367,6 @@ but ordinary
 `loom run` execution remains pipe-based and non-interactive. The observer does
 not mirror the terminal screen or accept agent input. Interactive command APIs,
 SSH, remote daemons, GUI, ACP hosting, model orchestration, input-required
-events, telemetry, and explicit human/agent handoff remain deferred. Deeper
+events, telemetry, and remote or human-input handoff remain deferred. Deeper
 provider integrations such as hosting the Codex app-server protocol also remain
 outside the current hook-based adapter.

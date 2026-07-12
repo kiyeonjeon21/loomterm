@@ -6,13 +6,14 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{
+    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, AgentSessionState,
     CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
     ExecutionRequest, ExecutionState, ExecutionStats, ExecutionStatusCounts, InitiatorStats,
     OutputStream, ReadOutputResponse, Workspace, new_id, now_ms,
 };
 use crate::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const STORE_QUEUE_DEPTH: usize = 512;
 
 #[derive(Debug)]
@@ -91,6 +92,31 @@ enum StoreCommand {
         since_ms: i64,
         until_ms: i64,
         reply: oneshot::Sender<Result<ExecutionStats>>,
+    },
+    CreateAgentSession {
+        request: Box<AgentSessionRequest>,
+        reply: oneshot::Sender<Result<AgentSession>>,
+    },
+    FinishAgentSession {
+        id: String,
+        finish: AgentSessionFinish,
+        reply: oneshot::Sender<Result<AgentSession>>,
+    },
+    GetAgentSession {
+        id: String,
+        reply: oneshot::Sender<Result<AgentSessionDetail>>,
+    },
+    ListAgentSessions {
+        workspace: Option<String>,
+        limit: u32,
+        reply: oneshot::Sender<Result<Vec<AgentSession>>>,
+    },
+    DeleteAgentSession {
+        id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ActiveAgentSessions {
+        reply: oneshot::Sender<Result<Vec<AgentSession>>>,
     },
     ReadOutput {
         id: String,
@@ -311,6 +337,64 @@ impl Store {
         .await
     }
 
+    pub async fn create_agent_session(
+        &self,
+        request: &AgentSessionRequest,
+    ) -> Result<AgentSession> {
+        self.request(|reply| StoreCommand::CreateAgentSession {
+            request: Box::new(request.clone()),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn finish_agent_session(
+        &self,
+        id: &str,
+        finish: AgentSessionFinish,
+    ) -> Result<AgentSession> {
+        self.request(|reply| StoreCommand::FinishAgentSession {
+            id: id.to_owned(),
+            finish,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn get_agent_session(&self, id: &str) -> Result<AgentSessionDetail> {
+        self.request(|reply| StoreCommand::GetAgentSession {
+            id: id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn list_agent_sessions(
+        &self,
+        workspace: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AgentSession>> {
+        self.request(|reply| StoreCommand::ListAgentSessions {
+            workspace: workspace.map(str::to_owned),
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn delete_agent_session(&self, id: &str) -> Result<()> {
+        self.request(|reply| StoreCommand::DeleteAgentSession {
+            id: id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn active_agent_sessions(&self) -> Result<Vec<AgentSession>> {
+        self.request(|reply| StoreCommand::ActiveAgentSessions { reply })
+            .await
+    }
+
     pub async fn read_output(
         &self,
         id: &str,
@@ -409,6 +493,29 @@ impl Database {
                     created_at_ms INTEGER NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1
                  );
+                 CREATE TABLE agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                    state TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL,
+                    name TEXT,
+                    command_json TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    recorder_pid INTEGER NOT NULL,
+                    outcome_json TEXT,
+                    captured_bytes INTEGER NOT NULL DEFAULT 0,
+                    output_truncated INTEGER NOT NULL DEFAULT 0,
+                    initial_cols INTEGER NOT NULL,
+                    initial_rows INTEGER NOT NULL,
+                    cast_path TEXT NOT NULL,
+                    html_path TEXT NOT NULL
+                 );
+                 CREATE INDEX agent_sessions_workspace_created
+                    ON agent_sessions(workspace_id, created_at_ms DESC);
+                 CREATE INDEX agent_sessions_state_created
+                    ON agent_sessions(state, created_at_ms);
                  CREATE TABLE executions (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -425,8 +532,11 @@ impl Database {
                     outcome_json TEXT,
                     captured_bytes INTEGER NOT NULL DEFAULT 0,
                     output_truncated INTEGER NOT NULL DEFAULT 0,
-                    last_seq INTEGER NOT NULL DEFAULT 0
+                    last_seq INTEGER NOT NULL DEFAULT 0,
+                    session_id TEXT REFERENCES agent_sessions(id) ON DELETE SET NULL
                  );
+                 CREATE INDEX executions_session_created
+                    ON executions(session_id, created_at_ms);
                  CREATE INDEX executions_workspace_created
                     ON executions(workspace_id, created_at_ms DESC);
                  CREATE INDEX executions_state_created
@@ -441,7 +551,7 @@ impl Database {
                     payload_json TEXT,
                     PRIMARY KEY(execution_id, seq)
                  );
-                 PRAGMA user_version = 2;
+                 PRAGMA user_version = 3;
                  COMMIT;",
             )?;
         } else if version == 1 {
@@ -449,6 +559,40 @@ impl Database {
                 "BEGIN;
                  ALTER TABLE workspaces ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
                  PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
+        if version <= 2 && version != 0 {
+            connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                    state TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL,
+                    name TEXT,
+                    command_json TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    recorder_pid INTEGER NOT NULL,
+                    outcome_json TEXT,
+                    captured_bytes INTEGER NOT NULL DEFAULT 0,
+                    output_truncated INTEGER NOT NULL DEFAULT 0,
+                    initial_cols INTEGER NOT NULL,
+                    initial_rows INTEGER NOT NULL,
+                    cast_path TEXT NOT NULL,
+                    html_path TEXT NOT NULL
+                 );
+                 CREATE INDEX agent_sessions_workspace_created
+                    ON agent_sessions(workspace_id, created_at_ms DESC);
+                 CREATE INDEX agent_sessions_state_created
+                    ON agent_sessions(state, created_at_ms);
+                 ALTER TABLE executions ADD COLUMN session_id TEXT
+                    REFERENCES agent_sessions(id) ON DELETE SET NULL;
+                 CREATE INDEX executions_session_created
+                    ON executions(session_id, created_at_ms);
+                 PRAGMA user_version = 3;
                  COMMIT;",
             )?;
         }
@@ -577,6 +721,19 @@ impl Database {
 
     pub fn create_execution(&self, request: &ExecutionRequest, cwd: &Path) -> Result<Execution> {
         request.validate()?;
+        if let Some(session_id) = request.initiator.session_id.as_deref() {
+            let session = self.get_agent_session_record(session_id)?;
+            if session.workspace_id != request.workspace_id {
+                return Err(Error::InvalidRequest(format!(
+                    "agent session {session_id} belongs to a different workspace"
+                )));
+            }
+            if session.state != AgentSessionState::Recording {
+                return Err(Error::InvalidRequest(format!(
+                    "agent session {session_id} is no longer recording"
+                )));
+            }
+        }
         let id = new_id();
         let created_at_ms = now_ms();
         let env_keys: Vec<String> = request.env.keys().cloned().collect();
@@ -586,8 +743,8 @@ impl Database {
         self.connection()?.execute(
             "INSERT INTO executions(
                 id, workspace_id, state, command_json, cwd, env_keys_json,
-                initiator_json, created_at_ms
-             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7)",
+                initiator_json, created_at_ms, session_id
+             ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 request.workspace_id,
@@ -595,7 +752,8 @@ impl Database {
                 cwd.to_string_lossy().as_ref(),
                 env_keys_json,
                 initiator_json,
-                created_at_ms
+                created_at_ms,
+                request.initiator.session_id
             ],
         )?;
         self.get_execution(&id)
@@ -904,6 +1062,174 @@ impl Database {
         })
     }
 
+    pub fn create_agent_session(&self, request: &AgentSessionRequest) -> Result<AgentSession> {
+        request.validate()?;
+        let workspace = self.get_workspace(&request.workspace_id)?;
+        let cwd = Path::new(&request.cwd).canonicalize()?;
+        if cwd != workspace.root_path() && !cwd.starts_with(workspace.root_path()) {
+            return Err(Error::OutsideWorkspace {
+                path: cwd,
+                workspace: workspace.root_path(),
+            });
+        }
+        let id = request.id.clone();
+        let command_json = serde_json::to_string(&request.command)?;
+        self.connection()?.execute(
+            "INSERT INTO agent_sessions(
+                id, workspace_id, state, agent_kind, name, command_json, cwd,
+                created_at_ms, recorder_pid, initial_cols, initial_rows, cast_path, html_path
+             ) VALUES (?1, ?2, 'recording', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                workspace.id,
+                request.agent_kind,
+                request.name,
+                command_json,
+                cwd.to_string_lossy().as_ref(),
+                now_ms(),
+                request.recorder_pid,
+                request.initial_cols,
+                request.initial_rows,
+                request.cast_path,
+                request.html_path,
+            ],
+        )?;
+        self.get_agent_session_record(&id)
+    }
+
+    pub fn finish_agent_session(
+        &self,
+        id: &str,
+        finish: &AgentSessionFinish,
+    ) -> Result<AgentSession> {
+        if finish.state == AgentSessionState::Recording {
+            return Err(Error::InvalidRequest(
+                "finished agent session must use a terminal state".into(),
+            ));
+        }
+        if matches!(finish.state, AgentSessionState::Interrupted)
+            != matches!(&finish.outcome, ExecutionOutcome::Interrupted { .. })
+        {
+            return Err(Error::InvalidRequest(
+                "interrupted agent session state and outcome must agree".into(),
+            ));
+        }
+        let current = self.get_agent_session_record(id)?;
+        if current.state.is_terminal() {
+            return Ok(current);
+        }
+        let outcome_json = serde_json::to_string(&finish.outcome)?;
+        self.connection()?.execute(
+            "UPDATE agent_sessions SET state = ?2, ended_at_ms = ?3, outcome_json = ?4,
+                captured_bytes = ?5, output_truncated = ?6 WHERE id = ?1",
+            params![
+                id,
+                finish.state.as_str(),
+                now_ms(),
+                outcome_json,
+                finish.captured_bytes as i64,
+                i64::from(finish.output_truncated),
+            ],
+        )?;
+        self.get_agent_session_record(id)
+    }
+
+    pub fn get_agent_session(&self, id: &str) -> Result<AgentSessionDetail> {
+        let session = self.get_agent_session_record(id)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, workspace_id, state, command_json, cwd, env_keys_json,
+                initiator_json, created_at_ms, started_at_ms, ended_at_ms, pid, pgid,
+                outcome_json, captured_bytes, output_truncated, last_seq
+             FROM executions WHERE session_id = ?1 ORDER BY created_at_ms",
+        )?;
+        let executions = statement
+            .query_map([id], execution_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(AgentSessionDetail {
+            session,
+            executions,
+        })
+    }
+
+    pub fn list_agent_sessions(
+        &self,
+        workspace: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AgentSession>> {
+        let connection = self.connection()?;
+        let sql = if workspace.is_some() {
+            "SELECT s.id, s.workspace_id, s.state, s.agent_kind, s.name, s.command_json,
+                s.cwd, s.created_at_ms, s.ended_at_ms, s.recorder_pid, s.outcome_json,
+                s.captured_bytes, s.output_truncated, s.initial_cols, s.initial_rows,
+                s.cast_path, s.html_path
+             FROM agent_sessions s JOIN workspaces w ON w.id = s.workspace_id
+             WHERE s.workspace_id = ?1 OR w.name = ?1
+             ORDER BY s.created_at_ms DESC LIMIT ?2"
+        } else {
+            "SELECT id, workspace_id, state, agent_kind, name, command_json,
+                cwd, created_at_ms, ended_at_ms, recorder_pid, outcome_json,
+                captured_bytes, output_truncated, initial_cols, initial_rows,
+                cast_path, html_path
+             FROM agent_sessions ORDER BY created_at_ms DESC LIMIT ?2"
+        };
+        let mut statement = connection.prepare(sql)?;
+        statement
+            .query_map(params![workspace, limit], agent_session_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn active_agent_sessions(&self) -> Result<Vec<AgentSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, workspace_id, state, agent_kind, name, command_json,
+                cwd, created_at_ms, ended_at_ms, recorder_pid, outcome_json,
+                captured_bytes, output_truncated, initial_cols, initial_rows,
+                cast_path, html_path
+             FROM agent_sessions WHERE state = 'recording' ORDER BY created_at_ms",
+        )?;
+        statement
+            .query_map([], agent_session_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_agent_session(&self, id: &str) -> Result<()> {
+        let session = self.get_agent_session_record(id)?;
+        if !session.state.is_terminal() {
+            return Err(Error::InvalidRequest(format!(
+                "agent session {id} is still recording"
+            )));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE executions SET session_id = NULL,
+                initiator_json = json_remove(initiator_json, '$.session_id')
+             WHERE session_id = ?1",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM agent_sessions WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_agent_session_record(&self, id: &str) -> Result<AgentSession> {
+        self.connection()?
+            .query_row(
+                "SELECT id, workspace_id, state, agent_kind, name, command_json,
+                    cwd, created_at_ms, ended_at_ms, recorder_pid, outcome_json,
+                    captured_bytes, output_truncated, initial_cols, initial_rows,
+                    cast_path, html_path
+                 FROM agent_sessions WHERE id = ?1",
+                [id],
+                agent_session_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| Error::AgentSessionNotFound(id.into()))
+    }
+
     pub fn read_output(
         &self,
         id: &str,
@@ -1083,6 +1409,28 @@ fn run_store_actor(database: Database, mut receiver: mpsc::Receiver<StoreCommand
             } => {
                 let _ = reply.send(database.execution_stats(&workspace, since_ms, until_ms));
             }
+            StoreCommand::CreateAgentSession { request, reply } => {
+                let _ = reply.send(database.create_agent_session(&request));
+            }
+            StoreCommand::FinishAgentSession { id, finish, reply } => {
+                let _ = reply.send(database.finish_agent_session(&id, &finish));
+            }
+            StoreCommand::GetAgentSession { id, reply } => {
+                let _ = reply.send(database.get_agent_session(&id));
+            }
+            StoreCommand::ListAgentSessions {
+                workspace,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(database.list_agent_sessions(workspace.as_deref(), limit));
+            }
+            StoreCommand::DeleteAgentSession { id, reply } => {
+                let _ = reply.send(database.delete_agent_session(&id));
+            }
+            StoreCommand::ActiveAgentSessions { reply } => {
+                let _ = reply.send(database.active_agent_sessions());
+            }
             StoreCommand::ReadOutput {
                 id,
                 after_seq,
@@ -1180,6 +1528,38 @@ fn execution_from_row(row: &Row<'_>) -> rusqlite::Result<Execution> {
     })
 }
 
+fn agent_session_from_row(row: &Row<'_>) -> rusqlite::Result<AgentSession> {
+    let state: String = row.get(2)?;
+    let command_json: String = row.get(5)?;
+    let command: CommandSpec = json_column(5, &command_json)?;
+    let outcome_json: Option<String> = row.get(10)?;
+    let created_at_ms: i64 = row.get(7)?;
+    let ended_at_ms: Option<i64> = row.get(8)?;
+    Ok(AgentSession {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        state: parse_agent_session_state(2, &state)?,
+        agent_kind: row.get(3)?,
+        name: row.get(4)?,
+        command_display: command.display(),
+        command,
+        cwd: row.get(6)?,
+        created_at_ms,
+        ended_at_ms,
+        duration_ms: ended_at_ms.map(|ended| ended.saturating_sub(created_at_ms).max(0) as u64),
+        recorder_pid: row.get(9)?,
+        outcome: outcome_json
+            .map(|value| json_column(10, &value))
+            .transpose()?,
+        captured_bytes: row.get::<_, i64>(11)?.max(0) as u64,
+        output_truncated: row.get::<_, i64>(12)? != 0,
+        initial_cols: row.get(13)?,
+        initial_rows: row.get(14)?,
+        cast_path: row.get(15)?,
+        html_path: row.get(16)?,
+    })
+}
+
 fn json_column<T: serde::de::DeserializeOwned>(index: usize, value: &str) -> rusqlite::Result<T> {
     serde_json::from_str(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1201,6 +1581,19 @@ fn parse_state(index: usize, value: &str) -> rusqlite::Result<ExecutionState> {
             index,
             rusqlite::types::Type::Text,
             format!("unknown execution state {value}").into(),
+        )),
+    }
+}
+
+fn parse_agent_session_state(index: usize, value: &str) -> rusqlite::Result<AgentSessionState> {
+    match value {
+        "recording" => Ok(AgentSessionState::Recording),
+        "finished" => Ok(AgentSessionState::Finished),
+        "interrupted" => Ok(AgentSessionState::Interrupted),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            format!("unknown agent session state {value}").into(),
         )),
     }
 }
@@ -1381,6 +1774,91 @@ mod tests {
         assert_eq!(output.events.len(), 3);
         assert!(output.execution.state.is_terminal());
         assert_eq!(output.execution.captured_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn correlates_and_deletes_agent_sessions_without_deleting_executions() {
+        let root = tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let workspace = store.add_workspace("test", root.path()).await.unwrap();
+        let session_id = new_id();
+        let session = store
+            .create_agent_session(&AgentSessionRequest {
+                id: session_id.clone(),
+                workspace_id: workspace.id.clone(),
+                agent_kind: "codex".into(),
+                name: Some("demo".into()),
+                command: CommandSpec::Argv {
+                    program: "codex".into(),
+                    args: Vec::new(),
+                },
+                cwd: root.path().to_string_lossy().into_owned(),
+                recorder_pid: 42,
+                initial_cols: 80,
+                initial_rows: 24,
+                cast_path: root
+                    .path()
+                    .join("recording.cast")
+                    .to_string_lossy()
+                    .into_owned(),
+                html_path: root
+                    .path()
+                    .join("replay.html")
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.state, AgentSessionState::Recording);
+
+        let mut execution_request = request(workspace.id);
+        execution_request.initiator.session_id = Some(session_id.clone());
+        let execution = store
+            .create_execution(&execution_request, root.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_agent_session(&session_id)
+                .await
+                .unwrap()
+                .executions
+                .len(),
+            1
+        );
+
+        store
+            .finish_agent_session(
+                &session_id,
+                AgentSessionFinish {
+                    state: AgentSessionState::Finished,
+                    outcome: ExecutionOutcome::Exited { code: 0 },
+                    captured_bytes: 12,
+                    output_truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        store.prune(0, 0).await.unwrap();
+        assert_eq!(
+            store
+                .get_agent_session(&session_id)
+                .await
+                .unwrap()
+                .session
+                .id,
+            session_id
+        );
+        store.delete_agent_session(&session_id).await.unwrap();
+        assert_eq!(
+            store
+                .get_execution(&execution.id)
+                .await
+                .unwrap()
+                .initiator
+                .session_id,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1589,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_workspaces_as_active() {
+    fn migrates_v1_to_current_schema() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("legacy.db");
         let root = temp.path().canonicalize().unwrap();
@@ -1661,7 +2139,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 

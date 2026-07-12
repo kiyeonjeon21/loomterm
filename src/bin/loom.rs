@@ -4,12 +4,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use loomterm::client::DaemonClient;
-use loomterm::config::AppPaths;
+use loomterm::config::{AppPaths, Settings};
 use loomterm::model::{
-    CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
-    ExecutionRequest, ExecutionStats, Initiator, now_ms,
+    AgentSessionFinish, AgentSessionRequest, AgentSessionState, CommandSpec, Execution,
+    ExecutionEvent, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest, ExecutionStats,
+    Initiator, new_id, now_ms,
+};
+use loomterm::session::{
+    RecordSpec, SessionArtifacts, export_cast, open_html, record, terminal_size, write_replay_html,
 };
 use loomterm::{Error, Result};
 
@@ -48,6 +52,8 @@ enum Commands {
     },
     Stats(StatsArgs),
     #[command(subcommand)]
+    Session(SessionCommand),
+    #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor,
 }
@@ -63,6 +69,71 @@ enum WorkspaceCommand {
     Remove {
         workspace: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Record an interactive agent through a PTY and generate a local replay.
+    Record(SessionRecordArgs),
+    /// List recent recorded agent sessions.
+    List {
+        #[arg(short, long)]
+        workspace: Option<String>,
+        #[arg(short, long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show one session and its correlated executions.
+    Get { session_id: String },
+    /// Regenerate the replay and open it in the default browser.
+    Open { session_id: String },
+    /// Export a self-contained HTML replay or an asciicast file.
+    Export(SessionExportArgs),
+    /// Delete a finished session and its recording artifacts.
+    Delete { session_id: String },
+}
+
+#[derive(Debug, Args)]
+struct SessionRecordArgs {
+    #[arg(short, long)]
+    workspace: Option<String>,
+    #[arg(short, long)]
+    name: Option<String>,
+    #[arg(long, value_enum, default_value_t = AgentKindArg::Auto)]
+    agent: AgentKindArg,
+    #[arg(long)]
+    capture_limit_bytes: Option<u64>,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true,
+        value_name = "COMMAND"
+    )]
+    argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentKindArg {
+    Auto,
+    Codex,
+    Claude,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionExportFormat {
+    Html,
+    Cast,
+}
+
+#[derive(Debug, Args)]
+struct SessionExportArgs {
+    session_id: String,
+    #[arg(long, value_enum, default_value_t = SessionExportFormat::Html)]
+    format: SessionExportFormat,
+    #[arg(short, long)]
+    output: PathBuf,
+    #[arg(long)]
+    redact: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -124,7 +195,10 @@ struct StatsArgs {
 enum DaemonCommand {
     Start,
     Status,
-    Stop,
+    Stop {
+        #[arg(long)]
+        force: bool,
+    },
     Restart {
         #[arg(
             long,
@@ -152,7 +226,7 @@ async fn run(cli: Cli) -> Result<i32> {
     let client = match &cli.command {
         Commands::Daemon(DaemonCommand::Start) => DaemonClient::connect_or_start(&paths).await?,
         Commands::Daemon(
-            DaemonCommand::Status | DaemonCommand::Stop | DaemonCommand::Restart { .. },
+            DaemonCommand::Status | DaemonCommand::Stop { .. } | DaemonCommand::Restart { .. },
         ) => DaemonClient::new(&paths.socket),
         _ if cli.no_autostart => DaemonClient::new(&paths.socket),
         _ => DaemonClient::connect_or_start(&paths).await?,
@@ -208,13 +282,14 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Commands::Session(command) => handle_session(&client, &paths, command, cli.json).await,
         Commands::Daemon(command) => {
             match command {
                 DaemonCommand::Start | DaemonCommand::Status => {
                     print_value(&client.health().await?, cli.json)?;
                 }
-                DaemonCommand::Stop => {
-                    client.shutdown().await?;
+                DaemonCommand::Stop { force } => {
+                    client.shutdown_with_force(force).await?;
                     if !cli.json {
                         println!("loomd stopped");
                     }
@@ -250,6 +325,12 @@ async fn run(cli: Cli) -> Result<i32> {
                         .active_executions
                         .map_or_else(|| "unknown".into(), |count| count.to_string())
                 );
+                println!(
+                    "active sessions: {}",
+                    health
+                        .active_sessions
+                        .map_or_else(|| "unknown".into(), |count| count.to_string())
+                );
                 println!("socket: {}", health.socket_path);
                 println!("database: {}", health.database_path);
                 println!("workspaces: {}", workspaces.len());
@@ -280,9 +361,23 @@ async fn restart_daemon(
                 ));
             }
         }
+        match health.active_sessions {
+            Some(0) => {}
+            Some(count) => {
+                return Err(Error::InvalidRequest(format!(
+                    "daemon has {count} active agent session(s); wait for them or use --force"
+                )));
+            }
+            None => {
+                return Err(Error::InvalidRequest(
+                    "daemon does not report active agent sessions; use --force to restart it"
+                        .into(),
+                ));
+            }
+        }
     }
 
-    client.shutdown().await?;
+    client.shutdown_with_force(force).await?;
     for _ in 0..600 {
         if !paths.socket.exists() {
             let restarted = DaemonClient::connect_or_start(paths).await?;
@@ -336,6 +431,235 @@ async fn handle_workspace(
     Ok(())
 }
 
+async fn handle_session(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    command: SessionCommand,
+    json: bool,
+) -> Result<i32> {
+    match command {
+        SessionCommand::Record(args) => record_session(client, paths, args, json).await,
+        SessionCommand::List { workspace, limit } => {
+            let sessions = client.list_agent_sessions(workspace, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else {
+                for session in sessions {
+                    println!(
+                        "{:<12} {:<12} {:<10} {}",
+                        short_id(&session.id),
+                        session.state.as_str(),
+                        session.agent_kind,
+                        session.name.as_deref().unwrap_or(&session.command_display),
+                    );
+                }
+            }
+            Ok(0)
+        }
+        SessionCommand::Get { session_id } => {
+            let detail = client.get_agent_session(session_id).await?;
+            print_value(&detail, json)?;
+            Ok(0)
+        }
+        SessionCommand::Open { session_id } => {
+            let detail = client.get_agent_session(session_id).await?;
+            let cast = Path::new(&detail.session.cast_path);
+            let html = Path::new(&detail.session.html_path);
+            write_replay_html(&detail, cast, html, &[])?;
+            open_html(html)?;
+            if !json {
+                println!("opened {}", html.display());
+            }
+            Ok(0)
+        }
+        SessionCommand::Export(args) => {
+            let detail = client.get_agent_session(args.session_id).await?;
+            if args.redact.is_empty() {
+                eprintln!(
+                    "loom: export may contain prompts, command output, paths, and other sensitive data"
+                );
+            }
+            match args.format {
+                SessionExportFormat::Html => write_replay_html(
+                    &detail,
+                    Path::new(&detail.session.cast_path),
+                    &args.output,
+                    &args.redact,
+                )?,
+                SessionExportFormat::Cast => export_cast(
+                    Path::new(&detail.session.cast_path),
+                    &args.output,
+                    &args.redact,
+                )?,
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session_id": detail.session.id,
+                        "output": args.output,
+                    }))?
+                );
+            } else {
+                println!("exported {}", args.output.display());
+            }
+            Ok(0)
+        }
+        SessionCommand::Delete { session_id } => {
+            client.delete_agent_session(session_id).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn record_session(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    args: SessionRecordArgs,
+    json: bool,
+) -> Result<i32> {
+    if json {
+        return Err(Error::InvalidRequest(
+            "--json is not supported by interactive session recording".into(),
+        ));
+    }
+    let capture_limit_bytes = args
+        .capture_limit_bytes
+        .unwrap_or(Settings::load(paths)?.capture_limit_bytes);
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let workspace_id = resolve_workspace(client, args.workspace.as_deref()).await?;
+    let (initial_cols, initial_rows) = terminal_size()?;
+    let mut argv = args.argv.into_iter();
+    let program = argv
+        .next()
+        .ok_or_else(|| Error::InvalidRequest("missing agent command".into()))?;
+    let command = CommandSpec::Argv {
+        program,
+        args: argv.collect(),
+    };
+    let agent_kind = resolve_agent_kind(args.agent, &command);
+    let session_id = new_id();
+    let artifacts = SessionArtifacts::create(paths, &session_id)?;
+    let request = AgentSessionRequest {
+        id: session_id.clone(),
+        workspace_id,
+        agent_kind: agent_kind.clone(),
+        name: args.name,
+        command: command.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        recorder_pid: std::process::id(),
+        initial_cols,
+        initial_rows,
+        cast_path: artifacts.cast_path.to_string_lossy().into_owned(),
+        html_path: artifacts.html_path.to_string_lossy().into_owned(),
+    };
+    if let Err(error) = client.create_agent_session(request).await {
+        let _ = std::fs::remove_dir_all(&artifacts.directory);
+        return Err(error);
+    }
+    let spec = RecordSpec {
+        command,
+        cwd,
+        session_id: session_id.clone(),
+        agent_kind,
+        cast_path: artifacts.cast_path.clone(),
+        initial_cols,
+        initial_rows,
+        capture_limit_bytes,
+    };
+    let result = tokio::task::spawn_blocking(move || record(spec))
+        .await
+        .map_err(|error| Error::Config(format!("session recorder task failed: {error}")))?;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = finish_session_resilient(
+                client,
+                paths,
+                session_id.clone(),
+                AgentSessionFinish {
+                    state: AgentSessionState::Interrupted,
+                    outcome: ExecutionOutcome::Interrupted {
+                        reason: error.to_string(),
+                    },
+                    captured_bytes: 0,
+                    output_truncated: false,
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let state = if matches!(result.outcome, ExecutionOutcome::Interrupted { .. }) {
+        AgentSessionState::Interrupted
+    } else {
+        AgentSessionState::Finished
+    };
+    finish_session_resilient(
+        client,
+        paths,
+        session_id.clone(),
+        AgentSessionFinish {
+            state,
+            outcome: result.outcome.clone(),
+            captured_bytes: result.captured_bytes,
+            output_truncated: result.output_truncated,
+        },
+    )
+    .await?;
+    let active_client = DaemonClient::connect_or_start(paths).await?;
+    let detail = active_client.get_agent_session(session_id.clone()).await?;
+    write_replay_html(&detail, &artifacts.cast_path, &artifacts.html_path, &[])?;
+    eprintln!("\nloom: session {session_id}");
+    eprintln!("loom: replay {}", artifacts.html_path.display());
+    eprintln!("loom: cast {}", artifacts.cast_path.display());
+    Ok(result.exit_code)
+}
+
+async fn finish_session_resilient(
+    client: &DaemonClient,
+    paths: &AppPaths,
+    session_id: String,
+    finish: AgentSessionFinish,
+) -> Result<loomterm::model::AgentSession> {
+    match client
+        .finish_agent_session(session_id.clone(), finish.clone())
+        .await
+    {
+        Ok(session) => Ok(session),
+        Err(Error::DaemonUnavailable(_)) => {
+            DaemonClient::connect_or_start(paths)
+                .await?
+                .finish_agent_session(session_id, finish)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_agent_kind(requested: AgentKindArg, command: &CommandSpec) -> String {
+    match requested {
+        AgentKindArg::Codex => return "codex".into(),
+        AgentKindArg::Claude => return "claude".into(),
+        AgentKindArg::Generic => return "generic".into(),
+        AgentKindArg::Auto => {}
+    }
+    let CommandSpec::Argv { program, .. } = command else {
+        return "generic".into();
+    };
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program);
+    match name {
+        "codex" => "codex",
+        "claude" => "claude",
+        _ => "generic",
+    }
+    .into()
+}
+
 async fn run_command(client: &DaemonClient, args: RunArgs, json: bool) -> Result<i32> {
     let workspace_id = resolve_workspace(client, args.workspace.as_deref()).await?;
     let command = match args.shell {
@@ -368,7 +692,9 @@ async fn run_command(client: &DaemonClient, args: RunArgs, json: bool) -> Result
         initiator: Initiator {
             kind: "cli".into(),
             name: Some("loom".into()),
-            session_id: None,
+            session_id: std::env::var("LOOMTERM_SESSION_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
         },
         capture_limit_bytes: args.capture_limit_bytes,
     };

@@ -14,6 +14,7 @@ pub struct AppPaths {
     pub database: PathBuf,
     pub socket: PathBuf,
     pub lock_file: PathBuf,
+    pub sessions_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -43,6 +44,7 @@ impl AppPaths {
             database: state_dir.join("loom.db"),
             socket: runtime_dir.join("loomd.sock"),
             lock_file: runtime_dir.join("loomd.lock"),
+            sessions_dir: state_dir.join("sessions"),
             state_dir,
             runtime_dir,
             config_file,
@@ -51,6 +53,7 @@ impl AppPaths {
 
     pub fn ensure(&self) -> Result<()> {
         create_private_dir(&self.state_dir)?;
+        create_private_dir(&self.sessions_dir)?;
         create_private_dir(&self.runtime_dir)?;
         if let Some(parent) = self.config_file.parent() {
             create_private_dir(parent)?;

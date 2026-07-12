@@ -16,6 +16,8 @@ pub enum Error {
     WorkspaceNotFound(String),
     #[error("execution not found: {0}")]
     ExecutionNotFound(String),
+    #[error("agent session not found: {0}")]
+    AgentSessionNotFound(String),
     #[error("path {path:?} is outside workspace {workspace:?}")]
     OutsideWorkspace { path: PathBuf, workspace: PathBuf },
     #[error("invalid request: {0}")]

@@ -18,6 +18,8 @@ agent orchestrator, or an LLM client.
 - Workspace-scoped cwd validation and same-user Unix socket access.
 - Process-group cancellation with `SIGTERM` and `SIGKILL` escalation.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
+- An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
+- Self-contained HTML and asciicast exports correlated with Loomterm executions.
 
 Client disconnection does not stop a command. A daemon crash closes the private
 supervisor control pipe, which sends `SIGTERM` and then `SIGKILL` to the command
@@ -76,7 +78,7 @@ target/release/loom cancel EXECUTION_ID
 `loom cancel` returns after the execution reaches a terminal `cancelled` state.
 `loom daemon status` and `loom daemon stop` never start a missing daemon. After
 upgrading the binaries, use `loom daemon restart`; it refuses to interrupt active
-executions unless `--force` is explicit.
+executions or agent recordings unless `--force` is explicit.
 
 Use `--json` for structured output. `loom run --json` emits JSON Lines containing
 the initial execution, each event, and the terminal result.
@@ -92,11 +94,45 @@ When `--workspace` is omitted, `loom stats` selects the most specific registered
 workspace containing the current directory. Statistics are derived from the
 existing local SQLite execution records; Loomterm does not send usage telemetry.
 
+## Agent session recording
+
+Record an existing interactive agent from startup to exit without installing a
+GUI terminal:
+
+```sh
+target/release/loom session record --name feature-demo -- codex
+target/release/loom session record --name review-demo -- claude
+```
+
+The recorder relays the real TUI through a PTY and writes a private asciicast v3
+recording. It does not persist raw keyboard input. Text displayed by the agent,
+including visible prompts, is part of terminal output and is recorded.
+
+Commands run through `loom-mcp` or `loom run` inherit `LOOMTERM_SESSION_ID` and
+appear in the replay timeline. This repository forwards that value through its
+Codex configuration and includes `.mcp.json` for Claude Code.
+
+```sh
+target/release/loom session list
+target/release/loom session get SESSION_ID
+target/release/loom session open SESSION_ID
+target/release/loom session export SESSION_ID --format html --output demo.html
+target/release/loom session export SESSION_ID --format cast --output demo.cast \
+  --redact 'sensitive literal'
+target/release/loom session delete SESSION_ID
+```
+
+`session open` and HTML export regenerate the timeline from current durable
+execution records. HTML exports contain the player, recording, and timeline with
+no network dependency. Home directory paths are shortened to `~`; use repeated
+`--redact` arguments before sharing. Export cannot guarantee that arbitrary
+sensitive terminal output has been detected, so review the result first.
+
 ## MCP setup
 
-This repository includes a project-scoped Codex configuration in
-`.codex/config.toml`. Register the project once, then open Codex from this trusted
-repository:
+This repository includes project-scoped Codex and Claude Code MCP configurations
+in `.codex/config.toml` and `.mcp.json`. Register the project once, then open an
+agent from this trusted repository:
 
 ```sh
 cargo build --release --bins
@@ -160,7 +196,7 @@ systems do not provide a stronger total ordering across separate file descriptor
 
 The internal Unix socket uses length-prefixed JSON protocol v2 with tagged
 request, response, and event envelopes. Daemon health advertises its build
-version, active execution count, and additive protocol capabilities so a newer
+version, active execution/session counts, and additive protocol capabilities so a newer
 client can request an explicit restart instead of replacing a running daemon.
 `Subscribe { execution_id, after_seq }`
 replays durable events after the cursor and then pushes live events on the same
@@ -199,7 +235,8 @@ user.
 
 ## Current scope
 
-macOS and Linux are the current targets. PTY/TUI control, SSH, remote daemons, GUI,
-ACP hosting, and model orchestration are intentionally deferred. A future PTY
-mode should extend the same execution/event model with terminal snapshots,
-input-required events, and explicit human/agent handoff.
+macOS and Linux are the current targets. Loomterm can record an external agent's
+PTY, but ordinary `loom run` execution remains pipe-based and non-interactive.
+Interactive command APIs, SSH, remote daemons, GUI, ACP hosting, model
+orchestration, input-required events, and explicit human/agent handoff remain
+deferred.

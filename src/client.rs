@@ -10,12 +10,13 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::AppPaths;
 use crate::model::{
-    Execution, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse,
-    WaitResponse, Workspace,
+    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, Execution,
+    ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse, WaitResponse,
+    Workspace,
 };
 use crate::protocol::{
-    CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation, ProtocolResult, ResponseBody,
-    SubscriptionResponse, WireMessage,
+    CAPABILITY_AGENT_SESSIONS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation,
+    ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
 };
 use crate::{Error, Result};
 
@@ -127,6 +128,54 @@ impl DaemonClient {
         }
     }
 
+    pub async fn create_agent_session(&self, request: AgentSessionRequest) -> Result<AgentSession> {
+        self.require_capability(CAPABILITY_AGENT_SESSIONS).await?;
+        expect_agent_session(self.call(Operation::SessionCreate { request }).await?)
+    }
+
+    pub async fn finish_agent_session(
+        &self,
+        session_id: String,
+        finish: AgentSessionFinish,
+    ) -> Result<AgentSession> {
+        self.require_capability(CAPABILITY_AGENT_SESSIONS).await?;
+        expect_agent_session(
+            self.call(Operation::SessionFinish { session_id, finish })
+                .await?,
+        )
+    }
+
+    pub async fn get_agent_session(&self, session_id: String) -> Result<AgentSessionDetail> {
+        self.require_capability(CAPABILITY_AGENT_SESSIONS).await?;
+        match self.call(Operation::SessionGet { session_id }).await? {
+            ProtocolResult::AgentSessionDetail(value) => Ok(value),
+            value => unexpected("agent session detail", value),
+        }
+    }
+
+    pub async fn list_agent_sessions(
+        &self,
+        workspace: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<AgentSession>> {
+        self.require_capability(CAPABILITY_AGENT_SESSIONS).await?;
+        match self
+            .call(Operation::SessionList { workspace, limit })
+            .await?
+        {
+            ProtocolResult::AgentSessions(value) => Ok(value),
+            value => unexpected("agent sessions", value),
+        }
+    }
+
+    pub async fn delete_agent_session(&self, session_id: String) -> Result<()> {
+        self.require_capability(CAPABILITY_AGENT_SESSIONS).await?;
+        match self.call(Operation::SessionDelete { session_id }).await? {
+            ProtocolResult::Empty => Ok(()),
+            value => unexpected("empty response", value),
+        }
+    }
+
     pub async fn read_output(
         &self,
         execution_id: String,
@@ -209,7 +258,11 @@ impl DaemonClient {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        match self.call(Operation::Shutdown).await? {
+        self.shutdown_with_force(false).await
+    }
+
+    pub async fn shutdown_with_force(&self, force: bool) -> Result<()> {
+        match self.call(Operation::Shutdown { force }).await? {
             ProtocolResult::Empty => Ok(()),
             value => unexpected("empty response", value),
         }
@@ -341,6 +394,13 @@ fn expect_execution(result: ProtocolResult) -> Result<Execution> {
     }
 }
 
+fn expect_agent_session(result: ProtocolResult) -> Result<AgentSession> {
+    match result {
+        ProtocolResult::AgentSession(value) => Ok(value),
+        value => unexpected("agent session", value),
+    }
+}
+
 fn unexpected<T>(expected: &str, actual: ProtocolResult) -> Result<T> {
     Err(Error::Protocol(format!(
         "expected {expected} response, received {actual:?}"
@@ -428,6 +488,7 @@ mod tests {
             database: temp.path().join("state/loom.db"),
             socket: temp.path().join("loomd.sock"),
             lock_file: temp.path().join("loomd.lock"),
+            sessions_dir: temp.path().join("state/sessions"),
         };
         let server_socket = paths.socket.clone();
         let server = tokio::spawn(async move {

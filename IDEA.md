@@ -1,3 +1,12 @@
+## 2026-07 구현 결정: agent session flight recorder
+
+GUI terminal보다 먼저 외부 coding agent를 PTY로 감싸는 session recorder를
+추가한다. `loom session record -- codex|claude`가 사용자가 본 화면을 asciicast로
+보존하고, 같은 `LOOMTERM_SESSION_ID`로 발생한 durable execution을 HTML replay
+timeline에 연결한다. raw key input, hidden reasoning, model orchestration은 기록
+대상이 아니다. 이는 일반 `loom run`을 interactive PTY API로 바꾸는 작업이
+아니며, 기존 pipe 기반 execution substrate 위에 놓이는 opt-in demo 계층이다.
+
 ## 2026-07 자동 probe의 잠정 가설: packaging/onboarding
 
 기본 로컬 DB가 비어 있는 상태에서 약 2분 31초의 자동 probe를 수행했다. CLI

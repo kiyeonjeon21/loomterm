@@ -22,6 +22,7 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub struct LoomMcpServer {
     client: DaemonClient,
     workspace: Workspace,
+    session_id: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -42,6 +43,9 @@ impl LoomMcpServer {
         Self {
             client,
             workspace,
+            session_id: std::env::var("LOOMTERM_SESSION_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
             tool_router: Self::tool_router(),
         }
     }
@@ -229,7 +233,7 @@ impl LoomMcpServer {
                 initiator: Initiator {
                     kind: "mcp".into(),
                     name: Some("loom-mcp".into()),
-                    session_id: None,
+                    session_id: self.session_id.clone(),
                 },
                 capture_limit_bytes: input.capture_limit_bytes,
             })

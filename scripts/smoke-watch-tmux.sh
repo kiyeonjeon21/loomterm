@@ -12,6 +12,7 @@ binary="$repo/target/debug/loom"
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/loom-watch-smoke.XXXXXX")
 session="loom-watch-smoke-$$"
+recording_name="watch-smoke-$$"
 export LOOMTERM_STATE_DIR="$root/state"
 export LOOMTERM_RUNTIME_DIR="$root/run"
 export LOOMTERM_CONFIG="$root/config.toml"
@@ -32,7 +33,7 @@ setup="cd '$repo' && export LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RU
 
 tmux send-keys -t "$left" "$setup" Enter
 tmux send-keys -t "$left" \
-  "$binary session record --name watch-smoke -- sh -c '$binary run --shell \"printf one; sleep 2; printf two >&2; sleep 2; printf three\"; sleep 6'" Enter
+  "$binary session record --name $recording_name -- sh -c '$binary run --shell \"printf one; sleep 2; printf two >&2; sleep 2; printf three\"; sleep 6'" Enter
 sleep 1
 
 right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
@@ -49,4 +50,13 @@ tmux send-keys -t "$right" q
 sleep 1
 restored=$(tmux capture-pane -p -S - -t "$right")
 grep -q "WATCH_RESTORED" <<<"$restored"
+tmux kill-session -t "$session"
+for _ in {1..40}; do
+  pgrep -f "loom session record --name $recording_name" >/dev/null || break
+  sleep 0.1
+done
+if pgrep -f "loom session record --name $recording_name" >/dev/null; then
+  echo "recording process survived terminal shutdown" >&2
+  exit 1
+fi
 echo "watch tmux smoke: ok"

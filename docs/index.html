@@ -111,9 +111,9 @@
   <main>
     <header class="intro">
       <h1>Loomterm</h1>
-      <p class="lede">A live observer for coding-agent sessions and the durable command executions they create.</p>
+      <p class="lede">A workspace operator UI for coding-agent sessions and the durable command executions they create.</p>
     </header>
-    <section class="stage" aria-label="Live observer demo">
+    <section class="stage" aria-label="Operator UI handoff demo">
       <video controls autoplay muted loop playsinline poster="poster.webp">
         <source src="demo.mp4" type="video/mp4">
       </video>
@@ -127,12 +127,12 @@
     <section class="details">
       <div class="details-inner">
         <div>
-          <h2>Left: two agents</h2>
+          <h2>Top: two agents</h2>
           <p><code>loom agent codex</code> starts a worker and exits. <code>loom handoff claude</code> continues from the same execution.</p>
         </div>
         <div>
-          <h2>Right: durable work</h2>
-          <p><code>loom watch --active</code> follows the execution across sessions and marks the takeover as a handoff.</p>
+          <h2>Bottom: durable work</h2>
+          <p>Bare <code>loom</code> follows the same execution across sessions and marks the takeover as a handoff.</p>
         </div>
         <div>
           <h2>Afterward: two replays</h2>

@@ -34,11 +34,13 @@ struct Cli {
     #[arg(long, global = true, help = "Do not start loomd automatically")]
     no_autostart: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Open the workspace operator UI.
+    Ui(UiArgs),
     /// Register a workspace and safely configure project-scoped agent integrations.
     Init(InitArgs),
     #[command(subcommand)]
@@ -71,6 +73,12 @@ enum Commands {
     Doctor,
     #[command(hide = true)]
     AgentEvent(AgentEventArgs),
+}
+
+#[derive(Debug, Args, Default)]
+struct UiArgs {
+    #[arg(short, long)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -352,12 +360,23 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
-    if let Commands::AgentEvent(args) = &cli.command {
+    let command = cli
+        .command
+        .unwrap_or_else(|| Commands::Ui(UiArgs::default()));
+    if let Commands::AgentEvent(args) = &command {
         record_agent_hook_event(args.provider).await;
         return Ok(0);
     }
+    if matches!(command, Commands::Ui(_)) {
+        if cli.json {
+            return Err(Error::InvalidRequest(
+                "--json is not supported by the interactive operator UI".into(),
+            ));
+        }
+        loomterm::terminal::ensure_interactive("loom ui")?;
+    }
     let paths = AppPaths::discover()?;
-    if let Commands::Init(args) = &cli.command
+    if let Commands::Init(args) = &command
         && args.dry_run
     {
         let plan = loomterm::onboarding::plan(
@@ -370,7 +389,7 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     paths.ensure()?;
-    let client = match &cli.command {
+    let client = match &command {
         Commands::Daemon(DaemonCommand::Start) => DaemonClient::connect_or_start(&paths).await?,
         Commands::Daemon(
             DaemonCommand::Status | DaemonCommand::Stop { .. } | DaemonCommand::Restart { .. },
@@ -379,7 +398,8 @@ async fn run(cli: Cli) -> Result<i32> {
         _ => DaemonClient::connect_or_start(&paths).await?,
     };
 
-    match cli.command {
+    match command {
+        Commands::Ui(args) => operator_ui(&client, &paths, args).await,
         Commands::Init(args) => {
             let plan = loomterm::onboarding::plan(
                 &args.path,
@@ -603,6 +623,98 @@ async fn watch_session(client: &DaemonClient, args: WatchArgs, json: bool) -> Re
     };
     loomterm::watch::run(client, detail).await?;
     Ok(0)
+}
+
+async fn operator_ui(client: &DaemonClient, paths: &AppPaths, args: UiArgs) -> Result<i32> {
+    let workspace = selected_workspace(client, args.workspace.as_deref())
+        .await
+        .map_err(|error| match error {
+            Error::InvalidRequest(message)
+                if message.contains("not in a registered workspace") =>
+            {
+                Error::InvalidRequest(
+                    "current directory is not initialized; run `loom init .`, or use `loom ui --workspace <name>`"
+                        .into(),
+                )
+            }
+            error => error,
+        })?;
+    let mut selected_session_id = None;
+    let mut notice = None;
+    loop {
+        let action = loomterm::ui::run(
+            client,
+            loomterm::ui::UiOptions {
+                workspace: workspace.clone(),
+                selected_session_id: selected_session_id.take(),
+                notice: notice.take(),
+            },
+        )
+        .await?;
+        match action {
+            loomterm::ui::UiAction::Quit => return Ok(0),
+            loomterm::ui::UiAction::Launch { provider, prompt } => {
+                let provider = cli_provider(provider);
+                let result = launch_agent(
+                    client,
+                    paths,
+                    AgentLaunchArgs {
+                        provider,
+                        workspace: Some(workspace.id.clone()),
+                        name: None,
+                        capture_limit_bytes: None,
+                        prompt,
+                        allow_native_shell: false,
+                        agent_args: Vec::new(),
+                    },
+                    false,
+                )
+                .await;
+                notice = Some(match result {
+                    Ok(code) => format!("{} session exited with code {code}", provider.as_str()),
+                    Err(error) => format!("{} launch failed: {error}", provider.as_str()),
+                });
+            }
+            loomterm::ui::UiAction::Handoff {
+                provider,
+                source_session_id,
+            } => {
+                let provider = cli_provider(provider);
+                let result = launch_handoff(
+                    client,
+                    paths,
+                    HandoffArgs {
+                        provider,
+                        workspace: Some(workspace.id.clone()),
+                        from: Some(source_session_id),
+                        name: None,
+                        capture_limit_bytes: None,
+                        allow_native_shell: false,
+                        agent_args: Vec::new(),
+                    },
+                    false,
+                )
+                .await;
+                notice = Some(match result {
+                    Ok(code) => format!("{} handoff exited with code {code}", provider.as_str()),
+                    Err(error) => format!("{} handoff failed: {error}", provider.as_str()),
+                });
+            }
+        }
+        selected_session_id = client
+            .list_agent_sessions(Some(workspace.id.clone()), 1)
+            .await
+            .ok()
+            .and_then(|sessions| sessions.into_iter().next())
+            .map(|session| session.id);
+    }
+}
+
+fn cli_provider(provider: loomterm::ui::AgentProvider) -> AgentProviderArg {
+    match provider {
+        loomterm::ui::AgentProvider::Codex => AgentProviderArg::Codex,
+        loomterm::ui::AgentProvider::Claude => AgentProviderArg::Claude,
+    }
 }
 
 fn print_init_plan(plan: &InitPlan, dry_run: bool, json: bool) -> Result<()> {
@@ -1611,7 +1723,7 @@ mod tests {
         let agent =
             Cli::try_parse_from(["loom", "agent", "--name", "work", "codex", "--", "--yolo"])
                 .unwrap();
-        let Commands::Agent(args) = agent.command else {
+        let Some(Commands::Agent(args)) = agent.command else {
             panic!("expected agent command");
         };
         assert!(matches!(args.provider, AgentProviderArg::Codex));
@@ -1622,7 +1734,7 @@ mod tests {
             "loom", "handoff", "--from", "source", "claude", "--", "--model", "sonnet",
         ])
         .unwrap();
-        let Commands::Handoff(args) = handoff.command else {
+        let Some(Commands::Handoff(args)) = handoff.command else {
             panic!("expected handoff command");
         };
         assert!(matches!(args.provider, AgentProviderArg::Claude));

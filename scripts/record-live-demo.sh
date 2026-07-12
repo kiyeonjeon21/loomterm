@@ -183,11 +183,13 @@ start_handoff() {
 }
 
 switch_observer() {
-  tmux send-keys -t "$right" q
+  tmux send-keys -t "$right" BTab
   sleep 1
-  tmux send-keys -t "$right" clear Enter
-  tmux send-keys -l -t "$right" "printf 'PHASE 2  CLAUDE TAKES OVER\\n'; sleep 2; loom watch --active"
-  tmux send-keys -t "$right" Enter
+  tmux send-keys -t "$right" Up Up Up
+  sleep 0.5
+  tmux send-keys -t "$right" Down
+  sleep 1
+  tmux send-keys -t "$right" Tab
 }
 
 control_handoff() {
@@ -292,14 +294,14 @@ source_prompt="Start python3 -u handoff_worker.py as a durable long-running task
 tmux new-session -d -x 160 -y 48 -s "$tmux_session" -n demo
 tmux set-option -t "$tmux_session" remain-on-exit on
 left=$(tmux display-message -p -t "$tmux_session":demo '#{pane_id}')
-right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
+right=$(tmux split-window -v -P -F '#{pane_id}' -t "$left")
 setup="cd '$fixture' && unset NO_COLOR && export TERM=xterm-256color COLORTERM=truecolor PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' && clear"
 
 tmux send-keys -t "$left" "$setup" Enter
 start_agent codex codex-starts-worker 3
 tmux send-keys -t "$right" "$setup" Enter
-tmux send-keys -t "$right" "sleep 3.5; loom watch --active" Enter
-tmux select-layout -t "$tmux_session":demo even-horizontal >/dev/null
+tmux send-keys -t "$right" "sleep 1; loom" Enter
+tmux select-layout -t "$tmux_session":demo even-vertical >/dev/null
 
 (
   rc=0
@@ -309,11 +311,8 @@ tmux select-layout -t "$tmux_session":demo even-horizontal >/dev/null
 ) &
 controller_pid=$!
 (
-  sleep 12
-  while tmux has-session -t "$tmux_session" 2>/dev/null; do
-    tmux send-keys -t "$right" Down Down Down
-    sleep 8
-  done
+  sleep 5
+  tmux send-keys -t "$right" Tab
 ) &
 scroll_pid=$!
 

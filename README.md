@@ -9,9 +9,9 @@ owns process lifecycles and exposes command input, separate stdout/stderr,
 timestamps, cancellation, and terminal outcomes without requiring an agent to
 scrape a terminal screen.
 
-The execution runtime remains headless. Its optional terminal UI observes
-durable records; Loomterm is not a terminal emulator, agent orchestrator, or
-LLM client.
+The execution runtime remains headless. Its operator UI observes and controls
+durable records without replacing your terminal emulator, editor, or agent
+client.
 
 ## Demo
 
@@ -24,7 +24,8 @@ In the real interactive capture, `loom agent codex` starts a long-running worker
 without the user naming an MCP tool, then exits. The worker stays alive;
 `loom handoff claude` supplies the original request and execution metadata,
 Claude reads the existing output, cancels the same execution, and verifies its
-terminal state. The observer labels that cross-session execution as a handoff.
+terminal state. The Operator UI below the provider terminal follows that shared
+execution and labels its cross-session source as a handoff.
 
 ## What it provides
 
@@ -39,7 +40,7 @@ terminal state. The observer labels that cross-session execution as a handoff.
 - An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
 - Provider-neutral agent turn records populated by Codex and Claude Code lifecycle hooks.
 - Recorded Codex/Claude launchers with opt-in strict shell routing and local handoff context.
-- A responsive terminal observer for live session and execution state.
+- A workspace operator UI for sessions, execution blocks, output, and agent handoff.
 - Self-contained HTML and asciicast exports correlated with Loomterm executions.
 
 Client disconnection does not stop a command. A daemon crash closes the private
@@ -83,6 +84,17 @@ is left untouched unless `--force` is explicit. Use `--dry-run`, `--agent codex`
 deactivates command execution and project selection without deleting durable
 history.
 
+Open the workspace operator UI:
+
+```sh
+loom
+```
+
+Bare `loom` and `loom ui` are equivalent. The UI shows every workspace
+execution under `All work`, including commands that are not attached to a
+recorded agent session. Use `--workspace NAME` when the current directory is
+outside the workspace you want to inspect.
+
 Run a direct command. The CLI streams the original stdout/stderr and exits with
 the child command's exit code:
 
@@ -123,6 +135,25 @@ loom stats --days 7 --json
 When `--workspace` is omitted, `loom stats` selects the most specific registered
 workspace containing the current directory. Statistics are derived from the
 existing local SQLite execution records; Loomterm does not send usage telemetry.
+
+## Operator UI
+
+The default `loom` screen is a keyboard-first, mouse-capable control surface.
+Wide terminals show sessions, structured execution blocks, and the selected
+output side by side. Medium and narrow terminals reduce this to two panes or a
+single focused pane without changing the commands.
+
+Use `Tab` or `Shift-Tab` to move focus, arrows or `j`/`k` to navigate, `/` to
+search sessions and executions, and `Ctrl-P` or `:` for the command palette.
+`n` starts a recorded Codex or Claude Code session, while `h` hands active work
+from the selected finished session to the other provider. The UI leaves raw
+mode and the alternate screen before opening the provider TUI, then returns to
+the newly recorded session when the provider exits.
+
+Execution actions remain available without leaving the dashboard: `c` confirms
+cancellation, `f` toggles output follow, `o` opens a completed replay, and `e`
+exports it. Click a session or execution to select it and use the mouse wheel to
+navigate the pane under the pointer. Press `?` for the complete key reference.
 
 ## Agent launch and handoff
 
@@ -338,6 +369,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 scripts/codex-smoke.sh
+scripts/smoke-ui-tmux.sh
 scripts/smoke-watch-tmux.sh
 ```
 
@@ -363,10 +395,10 @@ available to the local user.
 
 macOS and Linux are the current targets. Loomterm can record an external agent's
 PTY and observe its structured requests, actions, and executions in a local TUI,
-but ordinary
-`loom run` execution remains pipe-based and non-interactive. The observer does
-not mirror the terminal screen or accept agent input. Interactive command APIs,
-SSH, remote daemons, GUI, ACP hosting, model orchestration, input-required
-events, telemetry, and remote or human-input handoff remain deferred. Deeper
+but ordinary `loom run` execution remains pipe-based and non-interactive. The
+operator UI does not embed or mirror the provider terminal; the launched Codex
+or Claude TUI owns the terminal until it exits. Interactive command APIs, SSH,
+remote daemons, GUI, ACP hosting, model orchestration, input-required events,
+telemetry, and remote or human-input handoff remain deferred. Deeper
 provider integrations such as hosting the Codex app-server protocol also remain
 outside the current hook-based adapter.

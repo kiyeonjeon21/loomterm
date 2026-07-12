@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use fs4::FileExt;
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, poll};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
@@ -133,22 +136,12 @@ pub fn record(spec: RecordSpec) -> Result<RecordResult> {
         )
     });
 
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .map_err(|error| Error::Config(format!("failed to open PTY writer: {error}")))?;
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = [0_u8; 8192];
-        while let Ok(count) = stdin.read(&mut buffer) {
-            if count == 0 || writer.write_all(&buffer[..count]).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-        }
-    });
-
     let _raw_mode = RawModeGuard::enable()?;
+    let input_relay = InputRelay::start(writer);
     let resized = Arc::new(AtomicBool::new(false));
     let terminated = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGWINCH, Arc::clone(&resized))?;
@@ -174,6 +167,10 @@ pub fn record(spec: RecordSpec) -> Result<RecordResult> {
                 .map_err(|_| Error::Config("cast writer lock was poisoned".into()))?
                 .event("r", format!("{cols}x{rows}"))?;
         }
+        if input_relay.is_closed() || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            interrupted = true;
+            terminate_child_group(&mut *child)?;
+        }
         if terminated.swap(false, Ordering::SeqCst) {
             interrupted = true;
             terminate_child_group(&mut *child)?;
@@ -185,6 +182,7 @@ pub fn record(spec: RecordSpec) -> Result<RecordResult> {
     };
     child.disarm();
 
+    input_relay.finish()?;
     output_thread
         .join()
         .map_err(|_| Error::Config("PTY output thread panicked".into()))??;
@@ -219,6 +217,92 @@ pub fn record(spec: RecordSpec) -> Result<RecordResult> {
     })
 }
 
+struct InputRelay {
+    stop: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl InputRelay {
+    fn start<W>(mut writer: W) -> Self
+    where
+        W: Write + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let closed = Arc::new(AtomicBool::new(false));
+        let thread_closed = Arc::clone(&closed);
+        let handle = std::thread::spawn(move || {
+            let result = relay_input(&mut writer, &thread_stop);
+            thread_closed.store(true, Ordering::Release);
+            result
+        });
+        Self {
+            stop,
+            closed,
+            handle: Some(handle),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| Error::Config("PTY input thread panicked".into()))?
+    }
+}
+
+impl Drop for InputRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.join();
+    }
+}
+
+fn relay_input(writer: &mut dyn Write, stop: &AtomicBool) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut buffer = [0_u8; 8192];
+    while !stop.load(Ordering::Relaxed) {
+        let events = {
+            let mut poll_fd = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut poll_fd, 50_u16) {
+                Ok(0) => continue,
+                Ok(_) => poll_fd[0].revents().unwrap_or_else(PollFlags::empty),
+                Err(Errno::EINTR) => continue,
+                Err(error) => {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(error as i32)));
+                }
+            }
+        };
+        if events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            return Ok(());
+        }
+        if !events.contains(PollFlags::POLLIN) {
+            continue;
+        }
+        let count = stdin.read(&mut buffer)?;
+        if count == 0 || writer.write_all(&buffer[..count]).is_err() {
+            return Ok(());
+        }
+        if writer.flush().is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 fn command_builder(command: &CommandSpec) -> Result<CommandBuilder> {
     match command {
         CommandSpec::Argv { program, args } => {
@@ -247,6 +331,7 @@ fn terminate_child_group(child: &mut dyn portable_pty::Child) -> Result<()> {
         }
     }
     child.kill()?;
+    let _ = child.wait()?;
     Ok(())
 }
 

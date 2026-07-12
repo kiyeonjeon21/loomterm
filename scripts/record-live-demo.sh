@@ -37,26 +37,20 @@ tmux new-session -d -x 160 -y 48 -s "$session" -n demo
 tmux set-option -t "$session" remain-on-exit on
 left=$(tmux display-message -p -t "$session":demo '#{pane_id}')
 right=$(tmux split-window -h -P -F '#{pane_id}' -t "$left")
-tmux resize-pane -t "$left" -x 78
 setup="cd '$fixture' && export PATH='$bin_dir':\"\$PATH\" LOOMTERM_STATE_DIR='$LOOMTERM_STATE_DIR' LOOMTERM_RUNTIME_DIR='$LOOMTERM_RUNTIME_DIR' LOOMTERM_CONFIG='$LOOMTERM_CONFIG' LOOMTERM_DEMO_BIN_DIR='$bin_dir' && clear"
 
 tmux send-keys -t "$left" "$setup" Enter
 tmux send-keys -t "$left" \
-  "loom session record --agent codex --name codex-outcome-fix -- ./live-agent.sh" Enter
-
-for _ in {1..100}; do
-  if "$repo/target/release/loom" session list --json 2>/dev/null | grep -q '"recording"'; then
-    break
-  fi
-  sleep 0.1
-done
+  "sleep 3; loom session record --agent codex --name codex-outcome-fix -- ./live-agent.sh" Enter
 tmux send-keys -t "$right" "$setup" Enter
-tmux send-keys -t "$right" "loom watch --active" Enter
+tmux send-keys -t "$right" "sleep 3.5; loom watch --active" Enter
 
 (
-  sleep 18
+  sleep 1
+  tmux select-layout -t "$session":demo even-horizontal >/dev/null
+  sleep 17
   tmux send-keys -t "$right" Down Down Down Down Down Down Down Down Down Down
-  sleep 16
+  sleep 24
   tmux send-keys -t "$right" Down Down Down Down Down Down Down Down Down Down
 ) &
 

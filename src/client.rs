@@ -10,13 +10,13 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::AppPaths;
 use crate::model::{
-    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, Execution,
-    ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse, WaitResponse,
-    Workspace,
+    AgentEventRequest, AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest,
+    AgentTurn, Execution, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION,
+    ReadOutputResponse, WaitResponse, Workspace,
 };
 use crate::protocol::{
-    CAPABILITY_AGENT_SESSIONS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation,
-    ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
+    CAPABILITY_AGENT_SESSIONS, CAPABILITY_AGENT_TURNS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES,
+    Operation, ProtocolResult, ResponseBody, SubscriptionResponse, WireMessage,
 };
 use crate::{Error, Result};
 
@@ -173,6 +173,14 @@ impl DaemonClient {
         match self.call(Operation::SessionDelete { session_id }).await? {
             ProtocolResult::Empty => Ok(()),
             value => unexpected("empty response", value),
+        }
+    }
+
+    pub async fn record_agent_event(&self, request: AgentEventRequest) -> Result<AgentTurn> {
+        self.require_capability(CAPABILITY_AGENT_TURNS).await?;
+        match self.call(Operation::AgentEvent { request }).await? {
+            ProtocolResult::AgentTurn(value) => Ok(value),
+            value => unexpected("agent turn", value),
         }
     }
 

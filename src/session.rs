@@ -626,8 +626,10 @@ main {{ display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 
 aside {{ border-left: 1px solid #30343a; padding: 20px 0; overflow: auto; }}
 h2 {{ font-size: 13px; text-transform: uppercase; color: #9ca3af; padding: 0 18px 12px; margin: 0; letter-spacing: 0; }}
 .execution {{ appearance: none; background: transparent; color: inherit; border: 0; border-top: 1px solid #262a2f; display: block; text-align: left; width: 100%; padding: 13px 18px; cursor: pointer; }}
-.execution:hover, .execution:focus-visible {{ background: #1a1e22; outline: none; }}
+.request {{ appearance: none; background: #171a1d; color: inherit; border: 0; border-top: 1px solid #30343a; display: block; text-align: left; width: 100%; padding: 13px 18px; cursor: pointer; }}
+.execution:hover, .execution:focus-visible, .request:hover, .request:focus-visible {{ background: #1f2428; outline: none; }}
 .command {{ display: block; font: 13px ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.prompt {{ display: -webkit-box; font-size: 13px; line-height: 1.45; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }}
 .facts {{ display: flex; justify-content: space-between; margin-top: 7px; color: #9ca3af; font-size: 12px; }}
 .empty {{ color: #9ca3af; padding: 10px 18px; font-size: 13px; }}
 @media (max-width: 820px) {{ main {{ grid-template-columns: 1fr; }} aside {{ border-left: 0; border-top: 1px solid #30343a; }} #player-wrap {{ padding: 14px; }} }}
@@ -635,7 +637,7 @@ h2 {{ font-size: 13px; text-transform: uppercase; color: #9ca3af; padding: 0 18p
 </head>
 <body>
 <header><h1 id="title">Loomterm session</h1><div id="meta"></div></header>
-<main><section id="player-wrap"><div id="player"></div></section><aside><h2>Executions</h2><div id="timeline"></div></aside></main>
+<main><section id="player-wrap"><div id="player"></div></section><aside><h2>Agent requests</h2><div id="requests"></div><h2 style="padding-top:20px">Executions</h2><div id="timeline"></div></aside></main>
 <script>{PLAYER_JS}</script>
 <script>
 const decode = value => new TextDecoder().decode(Uint8Array.from(atob(value), c => c.charCodeAt(0)));
@@ -645,6 +647,18 @@ const player = AsciinemaPlayer.create({{data: cast}}, document.getElementById('p
 document.getElementById('title').textContent = detail.session.name || `${{detail.session.agent_kind}} session`;
 document.getElementById('meta').textContent = `${{detail.session.state}} · ${{Math.round((detail.session.duration_ms || 0) / 1000)}}s`;
 const timeline = document.getElementById('timeline');
+const requests = document.getElementById('requests');
+if (!(detail.turns || []).length) requests.innerHTML = '<div class="empty">No structured agent requests captured.</div>';
+for (const turn of detail.turns || []) {{
+  const button = document.createElement('button');
+  const actions = (detail.actions || []).filter(action => action.turn_id === turn.id);
+  const offset = Math.max(0, (turn.created_at_ms - detail.session.created_at_ms) / 1000);
+  button.className = 'request';
+  button.innerHTML = `<span class="prompt"></span><span class="facts"><span>${{turn.provider}} · ${{turn.state}}</span><span>${{actions.length}} actions</span></span>`;
+  button.querySelector('.prompt').textContent = turn.prompt || 'Prompt unavailable';
+  button.addEventListener('click', () => player.seek(offset));
+  requests.appendChild(button);
+}}
 if (!detail.executions.length) timeline.innerHTML = '<div class="empty">No correlated Loomterm executions.</div>';
 for (const execution of detail.executions) {{
   const button = document.createElement('button');

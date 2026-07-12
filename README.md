@@ -19,8 +19,8 @@ LLM client.
 
 [Watch the 50-second capture](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
 or [explore the interactive replay](https://kiyeonjeon21.github.io/loomterm/replay.html).
-This real Codex session fixes a failing test while nine MCP executions appear
-live in Loomterm's structured observer.
+This real Codex session fixes a failing test while its request, tool actions,
+and ten MCP executions appear live in Loomterm's structured observer.
 
 ## What it provides
 
@@ -33,6 +33,7 @@ live in Loomterm's structured observer.
 - Process-group cancellation with `SIGTERM` and `SIGKILL` escalation.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
 - An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
+- Provider-neutral agent turn records populated by Codex and Claude Code lifecycle hooks.
 - A responsive terminal observer for live session and execution state.
 - Self-contained HTML and asciicast exports correlated with Loomterm executions.
 
@@ -64,15 +65,15 @@ The CLI and MCP adapter start a sibling `loomd` automatically when needed.
 ## Quick start
 
 Initialize a project once. This registers the workspace and safely merges
-project-scoped Codex and Claude Code MCP settings without replacing unrelated
-configuration:
+project-scoped Codex and Claude Code MCP and lifecycle-hook settings without
+replacing unrelated configuration:
 
 ```sh
 loom init .
 ```
 
-Initialization is idempotent. A conflicting existing `loomterm` MCP entry is
-left untouched unless `--force` is explicit. Use `--dry-run`, `--agent codex`,
+Initialization is idempotent. A conflicting existing Loomterm MCP or hook entry
+is left untouched unless `--force` is explicit. Use `--dry-run`, `--agent codex`,
 `--agent claude`, or `--agent none` to control setup. `workspace remove`
 deactivates command execution and project selection without deleting durable
 history.
@@ -132,6 +133,13 @@ The recorder relays the real TUI through a PTY and writes a private asciicast v3
 recording. It does not persist raw keyboard input. Text displayed by the agent,
 including visible prompts, is part of terminal output and is recorded.
 
+For projects initialized with `loom init`, provider lifecycle hooks also attach
+structured requests and tool-action states to the active recording. Both Codex
+and Claude Code map into the same `turns` and `actions` fields returned by
+`loom session get --json`. A Loomterm MCP result is linked to its durable
+execution when the provider includes that result in `PostToolUse`. Tool input
+and generic tool output are not copied into these records.
+
 Commands run through `loom-mcp` or `loom run` inherit `LOOMTERM_SESSION_ID` and
 appear in the replay timeline. This repository forwards that value through its
 Codex configuration and includes `.mcp.json` for Claude Code.
@@ -147,10 +155,11 @@ loom session delete SESSION_ID
 ```
 
 `session open` and HTML export regenerate the timeline from current durable
-execution records. HTML exports contain the player, recording, and timeline with
-no network dependency. Home directory paths are shortened to `~`; use repeated
-`--redact` arguments before sharing. Export cannot guarantee that arbitrary
-sensitive terminal output has been detected, so review the result first.
+turn, action, and execution records. HTML exports contain the player, recording,
+and timeline with no network dependency. Home directory paths are shortened to
+`~`; use repeated `--redact` arguments before sharing. Export cannot guarantee
+that arbitrary sensitive prompts or terminal output have been detected, so
+review the result first.
 
 ## Live session observer
 
@@ -166,7 +175,9 @@ loom watch SESSION_ID
 session id and `--active` are mutually exclusive. The observer is interactive,
 so it rejects redirected input/output and `--json`.
 
-The header shows session state and duration. The execution list uses stable
+The header shows session state and duration. The agent request panel shows the
+latest Codex or Claude Code prompt, turn state, and observed tool actions. The
+execution list uses stable
 `queued`, `running`, `passed`, `failed`, and `cancelled` labels; the detail pane
 shows the selected command, cwd, outcome, duration, and merged stdout/stderr.
 Use `Tab` to change focus, arrows to select or scroll, `f` to toggle output
@@ -180,18 +191,33 @@ second. It retains at most 1 MiB of selected output for rendering; trimming the
 view never changes the durable database. A finished session stays open until
 the user exits.
 
-## MCP setup
+## Agent integration
 
-`loom init` creates or merges project-scoped Codex and Claude Code MCP
-configurations in `.codex/config.toml` and `.mcp.json`. Open an agent from the
-trusted project after initialization:
+`loom init` creates or merges project-scoped MCP configuration in
+`.codex/config.toml` and `.mcp.json`, Codex hooks in `.codex/hooks.json`, and
+Claude Code hooks in `.claude/settings.json`. It preserves unrelated settings
+and handlers. Open an agent from the project after initialization:
 
 ```sh
 loom init .
 codex mcp get loomterm --json
 ```
 
-The server exposes:
+Codex requires project-local hooks to be reviewed and trusted; use `/hooks`
+after opening the trusted project. Claude Code loads the project settings using
+its normal settings trust flow. The generated handlers are silent observers:
+they read provider JSON from stdin, prefer `LOOMTERM_SESSION_ID`, otherwise
+match the hook `cwd` and provider to an active recording, and never return a
+tool or prompt decision. See the official
+[Codex hooks guide](https://learn.chatgpt.com/docs/hooks) and
+[Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
+
+Lifecycle hooks are an additive observation channel, not the execution source
+of truth. In particular, current Codex hooks do not intercept every unified
+shell or non-shell call. Loomterm executions remain authoritative because
+`loomd` owns those processes directly.
+
+The MCP server exposes:
 
 - `loom_run`
 - `loom_get`
@@ -233,7 +259,9 @@ supervisor_path = "/absolute/path/to/loom-supervisor"
 ```
 
 Environment override values and initial stdin are never persisted. Only
-environment key names are recorded for auditability.
+environment key names are recorded for auditability. Structured agent records
+persist user prompts and the last assistant message, but not tool arguments or
+generic tool responses.
 
 ## Protocol semantics
 
@@ -283,14 +311,19 @@ Workspace registration constrains `cwd` and MCP record selection. It is not an
 OS filesystem or network sandbox. Commands inherit the permissions and baseline
 environment of the local user running `loomd`; only use Loomterm with trusted
 agents and review destructive tool calls. Environment override values and stdin
-are not persisted, but command processes can access resources available to that
-user.
+are not persisted, but recordings, structured prompts, assistant messages, and
+command output can contain secrets. Session artifacts use private file modes;
+review and redact exports before sharing. Command processes can access resources
+available to the local user.
 
 ## Current scope
 
 macOS and Linux are the current targets. Loomterm can record an external agent's
-PTY and observe its structured executions in a local TUI, but ordinary
+PTY and observe its structured requests, actions, and executions in a local TUI,
+but ordinary
 `loom run` execution remains pipe-based and non-interactive. The observer does
 not mirror the terminal screen or accept agent input. Interactive command APIs,
 SSH, remote daemons, GUI, ACP hosting, model orchestration, input-required
-events, telemetry, and explicit human/agent handoff remain deferred.
+events, telemetry, and explicit human/agent handoff remain deferred. Deeper
+provider integrations such as hosting the Codex app-server protocol also remain
+outside the current hook-based adapter.

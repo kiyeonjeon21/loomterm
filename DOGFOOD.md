@@ -169,3 +169,26 @@ This closes the immediate demo visibility gap without claiming a GUI terminal.
 The observer cannot mirror the agent screen, supply input, hand control to a
 human, subscribe to session events, or operate remotely. Those boundaries remain
 evidence-gated follow-up work.
+
+## Agent turn timeline validation: 2026-07-12
+
+The v0.5.0 candidate adds an observation channel for the part the PTY demo did
+not explain: which user request caused the visible agent work. `loom init` now
+merges provider lifecycle hooks beside the existing MCP configuration. Codex
+and Claude Code hook payloads normalize into the same turn/action records, while
+the daemon-owned execution remains the process source of truth.
+
+Unit coverage exercises Codex events with explicit turn ids, Claude Code events
+without turn ids, out-of-band tool completion, MCP execution-id extraction,
+SQLite v1-to-v4 migration, and idempotent preservation of unrelated project
+hook settings. The full unit, binary, and daemon integration suite passes. The
+live demo workflow now initializes the fixture's Codex hooks before recording,
+so the observer and HTML replay show the request, tool actions, and executions
+instead of relying on the viewer to infer the request from the agent screen.
+
+The adapter is intentionally best effort. It prefers the recorder environment
+and falls back to the provider hook's cwd plus the newest matching active
+recording. Unsupported events, malformed input, no matching recording, and
+daemon unavailability produce no hook decision and do not interrupt the
+provider. Prompt and final assistant text are sensitive local records and must
+be included in export review and redaction.

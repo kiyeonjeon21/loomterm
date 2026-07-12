@@ -162,3 +162,27 @@ spawn한 process의 boundary와 exit를 직접 소유한다.
 다음 검증은 실제 coding agent에 `loom-mcp`를 연결하고, 기존 shell tool 대비
 screen parsing, 재접속, long-running command 관찰이 얼마나 단순해지는지
 측정하는 것이다.
+## 2026-07 구현 결정: provider-neutral agent turn timeline
+
+PTY 화면만으로는 데모의 요청과 구조화된 실행 사이 관계가 불명확했다. v0.5는
+terminal transcript를 파싱하지 않고 Codex와 Claude Code의 공식 lifecycle hook을
+adapter로 사용한다. `UserPromptSubmit`, tool pre/post, `Stop` 계열 이벤트를
+`AgentTurn`과 `AgentAction`으로 정규화하고, Loomterm MCP 응답에서 확인된 execution
+id만 durable execution에 연결한다. raw tool input과 일반 tool output은 중복
+보관하지 않는다.
+
+이 모델은 provider session/turn/tool id를 외부 상관관계 키로만 사용하고 내부
+record는 Loomterm UUID를 가진다. Codex의 `turn_id`는 정확히 보존하며, turn id를
+제공하지 않는 Claude Code 이벤트는 provider session의 최신 active turn으로
+귀속한다. 누락되거나 순서가 바뀐 hook은 빈 prompt의 임시 turn으로 수용해 agent
+동작을 방해하지 않는다.
+
+`loom init`은 기존 MCP 설정과 함께 `.codex/hooks.json` 및
+`.claude/settings.json`을 unrelated handler를 보존하며 merge한다. hook command는
+`LOOMTERM_SESSION_ID`를 우선 사용하고, provider가 이를 전달하지 않으면 hook의
+`cwd`와 provider를 동일 workspace의 최신 active recording에 매칭한다. active
+recording이 없거나 daemon 오류가 발생하면 no-op이며 agent의 prompt나 tool 결정을
+바꾸지 않는다. `loom watch`와 self-contained HTML replay는 이제 agent
+request, action 상태, execution을 함께 보여준다. Codex hooks가 모든 unified exec와
+non-shell tool을 포착하지 않는 현재 한계 때문에 hook timeline은 관찰 정보이고,
+process truth는 계속 `loomd`의 execution record다.

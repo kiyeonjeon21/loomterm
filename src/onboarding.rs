@@ -36,8 +36,11 @@ pub struct InitPlan {
     pub root: PathBuf,
     pub name: String,
     pub mcp_command: PathBuf,
+    pub loom_command: PathBuf,
     pub codex: ConfigPlan,
+    pub codex_hooks: ConfigPlan,
     pub claude: ConfigPlan,
+    pub claude_hooks: ConfigPlan,
 }
 
 pub fn plan(
@@ -74,34 +77,235 @@ fn plan_with_command(
             "workspace name must not be empty".into(),
         ));
     }
+    let loom_command = mcp_command.with_file_name("loom");
     let codex_path = root.join(".codex/config.toml");
+    let codex_hooks_path = root.join(".codex/hooks.json");
     let claude_path = root.join(".mcp.json");
+    let claude_hooks_path = root.join(".claude/settings.json");
     let codex = if agents.codex {
         plan_codex(&codex_path, &mcp_command, force)?
     } else {
         skipped(codex_path)
+    };
+    let codex_hooks = if agents.codex {
+        plan_hooks(&codex_hooks_path, &loom_command, "codex", force)?
+    } else {
+        skipped(codex_hooks_path)
     };
     let claude = if agents.claude {
         plan_claude(&claude_path, &mcp_command, force)?
     } else {
         skipped(claude_path)
     };
+    let claude_hooks = if agents.claude {
+        plan_hooks(&claude_hooks_path, &loom_command, "claude", force)?
+    } else {
+        skipped(claude_hooks_path)
+    };
     Ok(InitPlan {
         root,
         name,
         mcp_command,
+        loom_command,
         codex,
+        codex_hooks,
         claude,
+        claude_hooks,
     })
 }
 
 pub fn apply(plan: &InitPlan) -> Result<()> {
-    for config in [&plan.codex, &plan.claude] {
+    for config in [
+        &plan.codex,
+        &plan.codex_hooks,
+        &plan.claude,
+        &plan.claude_hooks,
+    ] {
         if let Some(content) = &config.content {
             write_atomic(&config.path, content.as_bytes())?;
         }
     }
     Ok(())
+}
+
+fn plan_hooks(path: &Path, command: &Path, provider: &str, force: bool) -> Result<ConfigPlan> {
+    let source = read_optional(path)?;
+    let mut root: Value = match &source {
+        Some(source) => serde_json::from_str(source)
+            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?,
+        None => Value::Object(Map::new()),
+    };
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| Error::Config(format!("{}: root must be a JSON object", path.display())))?;
+    let hooks = root_object
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| Error::Config(format!("{}: hooks must be a JSON object", path.display())))?;
+    let events: &[&str] = if provider == "claude" {
+        &[
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Stop",
+            "StopFailure",
+        ]
+    } else {
+        &["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+    };
+    let desired = hook_handler(command, provider);
+    let mut exact_events = 0usize;
+    let mut stale = false;
+    for event in events {
+        let groups = hooks
+            .entry((*event).to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "{}: hooks.{event} must be a JSON array",
+                    path.display()
+                ))
+            })?;
+        let mut exact = false;
+        for group in groups.iter() {
+            let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for handler in handlers {
+                if is_loomterm_hook(handler, provider) {
+                    if handler == &desired {
+                        exact = true;
+                    } else {
+                        stale = true;
+                    }
+                }
+            }
+        }
+        exact_events += usize::from(exact);
+    }
+    if stale && !force {
+        return collision(path);
+    }
+    if !stale && exact_events == events.len() {
+        return Ok(ConfigPlan {
+            path: path.into(),
+            action: ConfigAction::Unchanged,
+            content: None,
+        });
+    }
+    for event in events {
+        let groups = hooks.get_mut(*event).and_then(Value::as_array_mut).unwrap();
+        for group in groups.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                handlers.retain(|handler| !is_loomterm_hook(handler, provider));
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|handlers| !handlers.is_empty())
+        });
+        groups.push(serde_json::json!({ "hooks": [desired.clone()] }));
+    }
+    let action = if stale {
+        ConfigAction::Replace
+    } else {
+        ConfigAction::Create
+    };
+    let mut content = serde_json::to_string_pretty(&root)?;
+    content.push('\n');
+    Ok(ConfigPlan {
+        path: path.into(),
+        action,
+        content: Some(content),
+    })
+}
+
+fn hook_handler(command: &Path, provider: &str) -> Value {
+    let environment = [
+        "LOOMTERM_CONFIG",
+        "LOOMTERM_STATE_DIR",
+        "LOOMTERM_RUNTIME_DIR",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        std::env::var_os(key).map(|value| (key, value.to_string_lossy().into_owned()))
+    })
+    .collect::<Vec<_>>();
+    if provider == "claude" {
+        let mut args = environment
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        if environment.is_empty() {
+            serde_json::json!({
+                "type": "command",
+                "command": command,
+                "args": ["agent-event", "--provider", provider],
+                "timeout": 5
+            })
+        } else {
+            args.push(command.to_string_lossy().into_owned());
+            args.extend(["agent-event".into(), "--provider".into(), provider.into()]);
+            serde_json::json!({
+                "type": "command",
+                "command": "/usr/bin/env",
+                "args": args,
+                "timeout": 5
+            })
+        }
+    } else {
+        let environment = environment
+            .iter()
+            .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let environment = if environment.is_empty() {
+            String::new()
+        } else {
+            format!("{environment} ")
+        };
+        serde_json::json!({
+            "type": "command",
+            "command": format!(
+                "{environment}{} agent-event --provider {provider}",
+                shell_quote(command.to_string_lossy().as_ref())
+            ),
+            "timeout": 5
+        })
+    }
+}
+
+fn is_loomterm_hook(handler: &Value, provider: &str) -> bool {
+    let suffix = format!("agent-event --provider {provider}");
+    if handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains(&suffix))
+    {
+        return true;
+    }
+    handler
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            args.windows(3).any(|values| {
+                values
+                    == [
+                        Value::String("agent-event".into()),
+                        Value::String("--provider".into()),
+                        Value::String(provider.into()),
+                    ]
+            })
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn plan_codex(path: &Path, command: &Path, force: bool) -> Result<ConfigPlan> {
@@ -243,7 +447,7 @@ fn skipped(path: PathBuf) -> ConfigPlan {
 
 fn collision<T>(path: &Path) -> Result<T> {
     Err(Error::Config(format!(
-        "{} already contains a different loomterm MCP configuration; use --force to replace only that entry",
+        "{} already contains a different Loomterm configuration; use --force to replace only Loomterm-managed entries",
         path.display()
     )))
 }
@@ -311,7 +515,9 @@ mod tests {
             .unwrap();
             assert_eq!(first.mcp_command, executable);
             assert_eq!(first.codex.action, ConfigAction::Create);
+            assert_eq!(first.codex_hooks.action, ConfigAction::Create);
             assert_eq!(first.claude.action, ConfigAction::Create);
+            assert_eq!(first.claude_hooks.action, ConfigAction::Create);
             apply(&first).unwrap();
             let second = plan_with_command(
                 workspace.path(),
@@ -325,7 +531,26 @@ mod tests {
             )
             .unwrap();
             assert_eq!(second.codex.action, ConfigAction::Unchanged);
+            assert_eq!(second.codex_hooks.action, ConfigAction::Unchanged);
             assert_eq!(second.claude.action, ConfigAction::Unchanged);
+            assert_eq!(second.claude_hooks.action, ConfigAction::Unchanged);
+
+            let codex_hooks: Value = serde_json::from_slice(
+                &fs::read(workspace.path().join(".codex/hooks.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                codex_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["type"],
+                "command"
+            );
+            let claude_hooks: Value = serde_json::from_slice(
+                &fs::read(workspace.path().join(".claude/settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                claude_hooks["hooks"]["PostToolUseFailure"][0]["hooks"][0]["args"],
+                serde_json::json!(["agent-event", "--provider", "claude"])
+            );
         }
     }
 

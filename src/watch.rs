@@ -17,12 +17,13 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::client::DaemonClient;
 use crate::model::{
-    AgentSession, AgentSessionDetail, AgentSessionState, Execution, ExecutionEvent,
-    ExecutionEventPayload, ExecutionOutcome, ExecutionState, OutputStream, now_ms,
+    AgentActionState, AgentSession, AgentSessionDetail, AgentSessionState, AgentTurnState,
+    Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome, ExecutionState,
+    OutputStream, now_ms,
 };
 use crate::session::{open_html, write_replay_html};
 use crate::{Error, Result};
@@ -32,7 +33,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const OUTPUT_PAGE_BYTES: usize = 256 * 1024;
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const MIN_WIDTH: u16 = 60;
-const MIN_HEIGHT: u16 = 18;
+const MIN_HEIGHT: u16 = 22;
 const WIDE_WIDTH: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,23 +518,25 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &mut WatchState) {
 
     let sections = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(7),
         Constraint::Min(10),
         Constraint::Length(1),
     ])
     .split(area);
     render_header(frame, state, sections[0]);
+    render_agent_request(frame, state, sections[1]);
     if area.width >= WIDE_WIDTH {
         let columns = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(sections[1]);
+            .split(sections[2]);
         render_executions(frame, state, columns[0]);
         render_output(frame, state, columns[1]);
     } else {
         let rows = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(sections[1]);
+            .split(sections[2]);
         render_executions(frame, state, rows[0]);
         render_output(frame, state, rows[1]);
     }
-    render_notice(frame, state, sections[2]);
+    render_notice(frame, state, sections[3]);
     if let Some(Confirmation::Cancel(execution_id)) = &state.confirmation {
         let area = centered_rect(54, 7, area);
         frame.render_widget(Clear, area);
@@ -570,11 +573,88 @@ fn render_header(frame: &mut ratatui::Frame<'_>, state: &WatchState, area: Rect)
             format_duration(duration),
             state.detail.executions.len()
         )),
+        Span::raw(format!("  {} requests", state.detail.turns.len())),
     ]);
     frame.render_widget(
         Paragraph::new(line).block(plain_block("Loomterm Live Observer")),
         area,
     );
+}
+
+fn render_agent_request(frame: &mut ratatui::Frame<'_>, state: &WatchState, area: Rect) {
+    let Some(turn) = state.detail.turns.last() else {
+        frame.render_widget(
+            Paragraph::new("Waiting for a Codex or Claude Code prompt...")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(plain_block("Agent request")),
+            area,
+        );
+        return;
+    };
+    let actions = state
+        .detail
+        .actions
+        .iter()
+        .filter(|action| action.turn_id == turn.id)
+        .collect::<Vec<_>>();
+    let turn_style = match turn.state {
+        AgentTurnState::Active => Style::default().fg(Color::Cyan),
+        AgentTurnState::Completed => Style::default().fg(Color::Green),
+        AgentTurnState::Failed | AgentTurnState::Interrupted => {
+            Style::default().fg(Color::LightRed)
+        }
+    };
+    let action_summary = if actions.is_empty() {
+        "No tool actions yet".to_owned()
+    } else {
+        let recent = actions
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|action| {
+                let status = match action.state {
+                    AgentActionState::Running => "run",
+                    AgentActionState::Completed => "ok",
+                    AgentActionState::Failed => "fail",
+                };
+                format!("[{status}] {}", compact_tool_name(&action.tool_name))
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        if actions.len() > 4 {
+            format!("+{} earlier  {recent}", actions.len() - 4)
+        } else {
+            recent
+        }
+    };
+    let prompt = if turn.prompt.is_empty() {
+        "Prompt unavailable (the session started before hooks were active)".to_owned()
+    } else {
+        turn.prompt.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{}  {}", turn.provider, turn.state.as_str()),
+                    turn_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {} actions", actions.len())),
+            ]),
+            Line::styled(prompt, Style::default().fg(Color::White)),
+            Line::styled(action_summary, Style::default().fg(Color::DarkGray)),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(plain_block("Agent request")),
+        area,
+    );
+}
+
+fn compact_tool_name(name: &str) -> &str {
+    name.strip_prefix("mcp__loomterm__").unwrap_or(name)
 }
 
 fn render_executions(frame: &mut ratatui::Frame<'_>, state: &WatchState, area: Rect) {
@@ -812,6 +892,8 @@ mod tests {
                 html_path: "/tmp/session.html".into(),
             },
             executions,
+            turns: Vec::new(),
+            actions: Vec::new(),
         }
     }
 

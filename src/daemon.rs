@@ -21,8 +21,8 @@ use crate::model::{
     PROTOCOL_VERSION, now_ms,
 };
 use crate::protocol::{
-    CAPABILITY_AGENT_SESSIONS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES, Operation,
-    ProtocolResult, SubscriptionResponse, WireMessage,
+    CAPABILITY_AGENT_SESSIONS, CAPABILITY_AGENT_TURNS, CAPABILITY_EXECUTION_STATS, MAX_FRAME_BYTES,
+    Operation, ProtocolResult, SubscriptionResponse, WireMessage,
 };
 use crate::store::Store;
 use crate::{Error, Result};
@@ -327,6 +327,7 @@ async fn dispatch(
                 capabilities: vec![
                     CAPABILITY_EXECUTION_STATS.into(),
                     CAPABILITY_AGENT_SESSIONS.into(),
+                    CAPABILITY_AGENT_TURNS.into(),
                 ],
                 active_executions: Some(engine.active_executions()),
                 active_sessions: Some(store.active_agent_sessions().await?.len() as u64),
@@ -398,6 +399,9 @@ async fn dispatch(
             store.delete_agent_session(&session_id).await?;
             Ok(ProtocolResult::Empty)
         }
+        Operation::AgentEvent { request } => Ok(ProtocolResult::AgentTurn(
+            store.record_agent_event(&request).await?,
+        )),
         Operation::ReadOutput {
             execution_id,
             after_seq,

@@ -3,14 +3,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::model::{
-    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, Execution,
-    ExecutionEvent, ExecutionRequest, ExecutionStats, Health, PROTOCOL_VERSION, ReadOutputResponse,
-    WaitResponse, Workspace,
+    AgentEventRequest, AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest,
+    AgentTurn, Execution, ExecutionEvent, ExecutionRequest, ExecutionStats, Health,
+    PROTOCOL_VERSION, ReadOutputResponse, WaitResponse, Workspace,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const CAPABILITY_EXECUTION_STATS: &str = "execution_stats_v1";
 pub const CAPABILITY_AGENT_SESSIONS: &str = "agent_sessions_v1";
+pub const CAPABILITY_AGENT_TURNS: &str = "agent_turns_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -119,6 +120,9 @@ pub enum Operation {
     SessionDelete {
         session_id: String,
     },
+    AgentEvent {
+        request: AgentEventRequest,
+    },
     ReadOutput {
         execution_id: String,
         #[serde(default)]
@@ -181,6 +185,7 @@ pub enum ProtocolResult {
     AgentSession(AgentSession),
     AgentSessions(Vec<AgentSession>),
     AgentSessionDetail(AgentSessionDetail),
+    AgentTurn(AgentTurn),
     Output(ReadOutputResponse),
     Wait(WaitResponse),
     Subscription(SubscriptionResponse),

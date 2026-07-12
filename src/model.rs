@@ -296,6 +296,155 @@ pub struct AgentSessionFinish {
 pub struct AgentSessionDetail {
     pub session: AgentSession,
     pub executions: Vec<Execution>,
+    #[serde(default)]
+    pub turns: Vec<AgentTurn>,
+    #[serde(default)]
+    pub actions: Vec<AgentAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnState {
+    Active,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl AgentTurnState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentTurn {
+    pub id: String,
+    pub session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    pub state: AgentTurnState,
+    pub prompt: String,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActionState {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl AgentActionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentAction {
+    pub id: String,
+    pub turn_id: String,
+    pub provider_action_id: String,
+    pub tool_name: String,
+    pub state: AgentActionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentEventRequest {
+    pub session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    #[serde(flatten)]
+    pub event: AgentEvent,
+}
+
+impl AgentEventRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.session_id.trim().is_empty()
+            || self.provider.trim().is_empty()
+            || self.provider_session_id.trim().is_empty()
+        {
+            return Err(Error::InvalidRequest(
+                "session_id, provider, and provider_session_id must not be empty".into(),
+            ));
+        }
+        if self
+            .provider_turn_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(Error::InvalidRequest(
+                "provider_turn_id must not be empty when present".into(),
+            ));
+        }
+        match &self.event {
+            AgentEvent::PromptSubmitted { prompt } if prompt.is_empty() => Err(
+                Error::InvalidRequest("agent prompt must not be empty".into()),
+            ),
+            AgentEvent::ToolStarted {
+                action_id,
+                tool_name,
+            }
+            | AgentEvent::ToolFinished {
+                action_id,
+                tool_name,
+                ..
+            } if action_id.trim().is_empty() || tool_name.trim().is_empty() => Err(
+                Error::InvalidRequest("action_id and tool_name must not be empty".into()),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AgentEvent {
+    PromptSubmitted {
+        prompt: String,
+    },
+    ToolStarted {
+        action_id: String,
+        tool_name: String,
+    },
+    ToolFinished {
+        action_id: String,
+        tool_name: String,
+        #[serde(default)]
+        failed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
+    },
+    TurnFinished {
+        #[serde(default)]
+        failed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_assistant_message: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

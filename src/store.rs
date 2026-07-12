@@ -6,14 +6,15 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{
-    AgentSession, AgentSessionDetail, AgentSessionFinish, AgentSessionRequest, AgentSessionState,
+    AgentAction, AgentActionState, AgentEvent, AgentEventRequest, AgentSession, AgentSessionDetail,
+    AgentSessionFinish, AgentSessionRequest, AgentSessionState, AgentTurn, AgentTurnState,
     CommandSpec, Execution, ExecutionEvent, ExecutionEventPayload, ExecutionOutcome,
     ExecutionRequest, ExecutionState, ExecutionStats, ExecutionStatusCounts, InitiatorStats,
     OutputStream, ReadOutputResponse, Workspace, new_id, now_ms,
 };
 use crate::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const STORE_QUEUE_DEPTH: usize = 512;
 
 #[derive(Debug)]
@@ -114,6 +115,10 @@ enum StoreCommand {
     DeleteAgentSession {
         id: String,
         reply: oneshot::Sender<Result<()>>,
+    },
+    RecordAgentEvent {
+        request: Box<AgentEventRequest>,
+        reply: oneshot::Sender<Result<AgentTurn>>,
     },
     ActiveAgentSessions {
         reply: oneshot::Sender<Result<Vec<AgentSession>>>,
@@ -390,6 +395,14 @@ impl Store {
         .await
     }
 
+    pub async fn record_agent_event(&self, request: &AgentEventRequest) -> Result<AgentTurn> {
+        self.request(|reply| StoreCommand::RecordAgentEvent {
+            request: Box::new(request.clone()),
+            reply,
+        })
+        .await
+    }
+
     pub async fn active_agent_sessions(&self) -> Result<Vec<AgentSession>> {
         self.request(|reply| StoreCommand::ActiveAgentSessions { reply })
             .await
@@ -551,7 +564,37 @@ impl Database {
                     payload_json TEXT,
                     PRIMARY KEY(execution_id, seq)
                  );
-                 PRAGMA user_version = 3;
+                 CREATE TABLE agent_turns (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    provider_session_id TEXT NOT NULL,
+                    provider_turn_id TEXT,
+                    state TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    last_assistant_message TEXT
+                 );
+                 CREATE UNIQUE INDEX agent_turns_provider_turn
+                    ON agent_turns(session_id, provider, provider_session_id, provider_turn_id)
+                    WHERE provider_turn_id IS NOT NULL;
+                 CREATE INDEX agent_turns_session_created
+                    ON agent_turns(session_id, created_at_ms);
+                 CREATE TABLE agent_actions (
+                    id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE,
+                    provider_action_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    execution_id TEXT REFERENCES executions(id) ON DELETE SET NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    UNIQUE(turn_id, provider_action_id)
+                 );
+                 CREATE INDEX agent_actions_turn_created
+                    ON agent_actions(turn_id, created_at_ms);
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         } else if version == 1 {
@@ -593,6 +636,43 @@ impl Database {
                  CREATE INDEX executions_session_created
                     ON executions(session_id, created_at_ms);
                  PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if version <= 3 && version != 0 {
+            connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE agent_turns (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    provider_session_id TEXT NOT NULL,
+                    provider_turn_id TEXT,
+                    state TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    last_assistant_message TEXT
+                 );
+                 CREATE UNIQUE INDEX agent_turns_provider_turn
+                    ON agent_turns(session_id, provider, provider_session_id, provider_turn_id)
+                    WHERE provider_turn_id IS NOT NULL;
+                 CREATE INDEX agent_turns_session_created
+                    ON agent_turns(session_id, created_at_ms);
+                 CREATE TABLE agent_actions (
+                    id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE,
+                    provider_action_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    execution_id TEXT REFERENCES executions(id) ON DELETE SET NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    UNIQUE(turn_id, provider_action_id)
+                 );
+                 CREATE INDEX agent_actions_turn_created
+                    ON agent_actions(turn_id, created_at_ms);
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         }
@@ -1119,19 +1199,137 @@ impl Database {
             return Ok(current);
         }
         let outcome_json = serde_json::to_string(&finish.outcome)?;
-        self.connection()?.execute(
+        let ended_at_ms = now_ms();
+        let connection = self.connection()?;
+        connection.execute(
             "UPDATE agent_sessions SET state = ?2, ended_at_ms = ?3, outcome_json = ?4,
                 captured_bytes = ?5, output_truncated = ?6 WHERE id = ?1",
             params![
                 id,
                 finish.state.as_str(),
-                now_ms(),
+                ended_at_ms,
                 outcome_json,
                 finish.captured_bytes as i64,
                 i64::from(finish.output_truncated),
             ],
         )?;
+        connection.execute(
+            "UPDATE agent_turns SET state = 'interrupted', ended_at_ms = ?2
+             WHERE session_id = ?1 AND state = 'active'",
+            params![id, ended_at_ms],
+        )?;
+        drop(connection);
         self.get_agent_session_record(id)
+    }
+
+    pub fn record_agent_event(&self, request: &AgentEventRequest) -> Result<AgentTurn> {
+        request.validate()?;
+        let session = self.get_agent_session_record(&request.session_id)?;
+        if session.state != AgentSessionState::Recording {
+            return Err(Error::InvalidRequest(format!(
+                "agent session {} is no longer recording",
+                request.session_id
+            )));
+        }
+        let now = now_ms();
+        let connection = self.connection()?;
+        let turn = match &request.event {
+            AgentEvent::PromptSubmitted { prompt } => {
+                connection.execute(
+                    "UPDATE agent_turns SET state = 'interrupted', ended_at_ms = ?4
+                     WHERE session_id = ?1 AND provider = ?2 AND provider_session_id = ?3
+                       AND state = 'active'
+                       AND (?5 IS NULL OR provider_turn_id IS NULL OR provider_turn_id <> ?5)",
+                    params![
+                        request.session_id,
+                        request.provider,
+                        request.provider_session_id,
+                        now,
+                        request.provider_turn_id,
+                    ],
+                )?;
+                if let Some(turn) = find_provider_turn(&connection, request)? {
+                    connection.execute(
+                        "UPDATE agent_turns SET state = 'active', prompt = ?2,
+                            ended_at_ms = NULL, last_assistant_message = NULL WHERE id = ?1",
+                        params![turn.id, prompt],
+                    )?;
+                    get_agent_turn(&connection, &turn.id)?
+                } else {
+                    insert_agent_turn(&connection, request, prompt, now)?
+                }
+            }
+            AgentEvent::ToolStarted {
+                action_id,
+                tool_name,
+            } => {
+                let turn = find_or_create_agent_turn(&connection, request, now)?;
+                connection.execute(
+                    "INSERT INTO agent_actions(
+                        id, turn_id, provider_action_id, tool_name, state, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, 'running', ?5)
+                     ON CONFLICT(turn_id, provider_action_id) DO UPDATE SET
+                        tool_name = excluded.tool_name, state = 'running', ended_at_ms = NULL",
+                    params![new_id(), turn.id, action_id, tool_name, now],
+                )?;
+                turn
+            }
+            AgentEvent::ToolFinished {
+                action_id,
+                tool_name,
+                failed,
+                execution_id,
+            } => {
+                let turn = find_or_create_agent_turn(&connection, request, now)?;
+                let execution_id = execution_id.as_deref().filter(|execution_id| {
+                    connection
+                        .query_row(
+                            "SELECT 1 FROM executions WHERE id = ?1 AND session_id = ?2",
+                            params![execution_id, request.session_id],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+                let state = if *failed { "failed" } else { "completed" };
+                connection.execute(
+                    "INSERT INTO agent_actions(
+                        id, turn_id, provider_action_id, tool_name, state, execution_id,
+                        created_at_ms, ended_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                     ON CONFLICT(turn_id, provider_action_id) DO UPDATE SET
+                        tool_name = excluded.tool_name, state = excluded.state,
+                        execution_id = COALESCE(excluded.execution_id, agent_actions.execution_id),
+                        ended_at_ms = excluded.ended_at_ms",
+                    params![
+                        new_id(),
+                        turn.id,
+                        action_id,
+                        tool_name,
+                        state,
+                        execution_id,
+                        now,
+                    ],
+                )?;
+                turn
+            }
+            AgentEvent::TurnFinished {
+                failed,
+                last_assistant_message,
+            } => {
+                let turn = find_or_create_agent_turn(&connection, request, now)?;
+                let state = if *failed { "failed" } else { "completed" };
+                connection.execute(
+                    "UPDATE agent_turns SET state = ?2, ended_at_ms = ?3,
+                        last_assistant_message = ?4 WHERE id = ?1",
+                    params![turn.id, state, now, last_assistant_message],
+                )?;
+                get_agent_turn(&connection, &turn.id)?
+            }
+        };
+        Ok(turn)
     }
 
     pub fn get_agent_session(&self, id: &str) -> Result<AgentSessionDetail> {
@@ -1146,9 +1344,28 @@ impl Database {
         let executions = statement
             .query_map([id], execution_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut turn_statement = connection.prepare(
+            "SELECT id, session_id, provider, provider_session_id, provider_turn_id,
+                state, prompt, created_at_ms, ended_at_ms, last_assistant_message
+             FROM agent_turns WHERE session_id = ?1 ORDER BY created_at_ms",
+        )?;
+        let turns = turn_statement
+            .query_map([id], agent_turn_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut action_statement = connection.prepare(
+            "SELECT a.id, a.turn_id, a.provider_action_id, a.tool_name, a.state,
+                a.execution_id, a.created_at_ms, a.ended_at_ms
+             FROM agent_actions a JOIN agent_turns t ON t.id = a.turn_id
+             WHERE t.session_id = ?1 ORDER BY a.created_at_ms",
+        )?;
+        let actions = action_statement
+            .query_map([id], agent_action_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(AgentSessionDetail {
             session,
             executions,
+            turns,
+            actions,
         })
     }
 
@@ -1347,6 +1564,109 @@ impl Database {
     }
 }
 
+fn find_provider_turn(
+    connection: &Connection,
+    request: &AgentEventRequest,
+) -> Result<Option<AgentTurn>> {
+    let Some(provider_turn_id) = request.provider_turn_id.as_deref() else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT id, session_id, provider, provider_session_id, provider_turn_id,
+                state, prompt, created_at_ms, ended_at_ms, last_assistant_message
+             FROM agent_turns
+             WHERE session_id = ?1 AND provider = ?2 AND provider_session_id = ?3
+               AND provider_turn_id = ?4",
+            params![
+                request.session_id,
+                request.provider,
+                request.provider_session_id,
+                provider_turn_id,
+            ],
+            agent_turn_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn find_active_turn(
+    connection: &Connection,
+    request: &AgentEventRequest,
+) -> Result<Option<AgentTurn>> {
+    connection
+        .query_row(
+            "SELECT id, session_id, provider, provider_session_id, provider_turn_id,
+                state, prompt, created_at_ms, ended_at_ms, last_assistant_message
+             FROM agent_turns
+             WHERE session_id = ?1 AND provider = ?2 AND provider_session_id = ?3
+               AND state = 'active'
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![
+                request.session_id,
+                request.provider,
+                request.provider_session_id,
+            ],
+            agent_turn_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn find_or_create_agent_turn(
+    connection: &Connection,
+    request: &AgentEventRequest,
+    created_at_ms: i64,
+) -> Result<AgentTurn> {
+    let existing = if request.provider_turn_id.is_some() {
+        find_provider_turn(connection, request)?
+    } else {
+        find_active_turn(connection, request)?
+    };
+    existing.map_or_else(
+        || insert_agent_turn(connection, request, "", created_at_ms),
+        Ok,
+    )
+}
+
+fn insert_agent_turn(
+    connection: &Connection,
+    request: &AgentEventRequest,
+    prompt: &str,
+    created_at_ms: i64,
+) -> Result<AgentTurn> {
+    let id = new_id();
+    connection.execute(
+        "INSERT INTO agent_turns(
+            id, session_id, provider, provider_session_id, provider_turn_id,
+            state, prompt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+        params![
+            id,
+            request.session_id,
+            request.provider,
+            request.provider_session_id,
+            request.provider_turn_id,
+            prompt,
+            created_at_ms,
+        ],
+    )?;
+    get_agent_turn(connection, &id)
+}
+
+fn get_agent_turn(connection: &Connection, id: &str) -> Result<AgentTurn> {
+    connection
+        .query_row(
+            "SELECT id, session_id, provider, provider_session_id, provider_turn_id,
+                state, prompt, created_at_ms, ended_at_ms, last_assistant_message
+             FROM agent_turns WHERE id = ?1",
+            [id],
+            agent_turn_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| Error::InvalidRequest(format!("agent turn not found: {id}")))
+}
+
 fn run_store_actor(database: Database, mut receiver: mpsc::Receiver<StoreCommand>) {
     while let Some(command) = receiver.blocking_recv() {
         match command {
@@ -1427,6 +1747,9 @@ fn run_store_actor(database: Database, mut receiver: mpsc::Receiver<StoreCommand
             }
             StoreCommand::DeleteAgentSession { id, reply } => {
                 let _ = reply.send(database.delete_agent_session(&id));
+            }
+            StoreCommand::RecordAgentEvent { request, reply } => {
+                let _ = reply.send(database.record_agent_event(&request));
             }
             StoreCommand::ActiveAgentSessions { reply } => {
                 let _ = reply.send(database.active_agent_sessions());
@@ -1560,6 +1883,36 @@ fn agent_session_from_row(row: &Row<'_>) -> rusqlite::Result<AgentSession> {
     })
 }
 
+fn agent_turn_from_row(row: &Row<'_>) -> rusqlite::Result<AgentTurn> {
+    let state: String = row.get(5)?;
+    Ok(AgentTurn {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        provider: row.get(2)?,
+        provider_session_id: row.get(3)?,
+        provider_turn_id: row.get(4)?,
+        state: parse_agent_turn_state(5, &state)?,
+        prompt: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        ended_at_ms: row.get(8)?,
+        last_assistant_message: row.get(9)?,
+    })
+}
+
+fn agent_action_from_row(row: &Row<'_>) -> rusqlite::Result<AgentAction> {
+    let state: String = row.get(4)?;
+    Ok(AgentAction {
+        id: row.get(0)?,
+        turn_id: row.get(1)?,
+        provider_action_id: row.get(2)?,
+        tool_name: row.get(3)?,
+        state: parse_agent_action_state(4, &state)?,
+        execution_id: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        ended_at_ms: row.get(7)?,
+    })
+}
+
 fn json_column<T: serde::de::DeserializeOwned>(index: usize, value: &str) -> rusqlite::Result<T> {
     serde_json::from_str(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1594,6 +1947,33 @@ fn parse_agent_session_state(index: usize, value: &str) -> rusqlite::Result<Agen
             index,
             rusqlite::types::Type::Text,
             format!("unknown agent session state {value}").into(),
+        )),
+    }
+}
+
+fn parse_agent_turn_state(index: usize, value: &str) -> rusqlite::Result<AgentTurnState> {
+    match value {
+        "active" => Ok(AgentTurnState::Active),
+        "completed" => Ok(AgentTurnState::Completed),
+        "failed" => Ok(AgentTurnState::Failed),
+        "interrupted" => Ok(AgentTurnState::Interrupted),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            format!("unknown agent turn state {value}").into(),
+        )),
+    }
+}
+
+fn parse_agent_action_state(index: usize, value: &str) -> rusqlite::Result<AgentActionState> {
+    match value {
+        "running" => Ok(AgentActionState::Running),
+        "completed" => Ok(AgentActionState::Completed),
+        "failed" => Ok(AgentActionState::Failed),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            format!("unknown agent action state {value}").into(),
         )),
     }
 }
@@ -1817,6 +2197,94 @@ mod tests {
             .create_execution(&execution_request, root.path())
             .await
             .unwrap();
+        let base_event = |provider: &str,
+                          provider_session_id: &str,
+                          provider_turn_id: Option<&str>,
+                          event: AgentEvent| AgentEventRequest {
+            session_id: session_id.clone(),
+            provider: provider.into(),
+            provider_session_id: provider_session_id.into(),
+            provider_turn_id: provider_turn_id.map(str::to_owned),
+            event,
+        };
+        store
+            .record_agent_event(&base_event(
+                "codex",
+                "codex-session",
+                Some("turn-1"),
+                AgentEvent::PromptSubmitted {
+                    prompt: "Run the tests".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&base_event(
+                "codex",
+                "codex-session",
+                Some("turn-1"),
+                AgentEvent::ToolStarted {
+                    action_id: "tool-1".into(),
+                    tool_name: "mcp__loomterm__loom_run".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&base_event(
+                "codex",
+                "codex-session",
+                Some("turn-1"),
+                AgentEvent::ToolFinished {
+                    action_id: "tool-1".into(),
+                    tool_name: "mcp__loomterm__loom_run".into(),
+                    failed: false,
+                    execution_id: Some(execution.id.clone()),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&base_event(
+                "codex",
+                "codex-session",
+                Some("turn-1"),
+                AgentEvent::TurnFinished {
+                    failed: false,
+                    last_assistant_message: Some("Tests passed".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&base_event(
+                "claude",
+                "claude-session",
+                None,
+                AgentEvent::PromptSubmitted {
+                    prompt: "Explain the failure".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .record_agent_event(&base_event(
+                "claude",
+                "claude-session",
+                None,
+                AgentEvent::TurnFinished {
+                    failed: true,
+                    last_assistant_message: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let detail = store.get_agent_session(&session_id).await.unwrap();
+        assert_eq!(detail.turns.len(), 2);
+        assert_eq!(detail.turns[0].state, AgentTurnState::Completed);
+        assert_eq!(detail.turns[1].state, AgentTurnState::Failed);
+        assert_eq!(detail.actions.len(), 1);
+        assert_eq!(detail.actions[0].execution_id, Some(execution.id.clone()));
         assert_eq!(
             store
                 .get_agent_session(&session_id)
@@ -2139,7 +2607,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 

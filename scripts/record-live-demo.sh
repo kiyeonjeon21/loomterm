@@ -30,8 +30,10 @@ cargo build --manifest-path "$repo/Cargo.toml" --release --bins
 mkdir -p "$bin_dir"
 ln -s "$repo/target/release/loom" "$bin_dir/loom"
 ln -s "$repo/target/release/loom-mcp" "$bin_dir/loom-mcp"
+ln -s "$repo/target/release/loomd" "$bin_dir/loomd"
+ln -s "$repo/target/release/loom-supervisor" "$bin_dir/loom-supervisor"
 cp "$repo/demo/live-agent.sh" "$fixture/live-agent.sh"
-"$repo/target/release/loom" workspace add "$fixture" --name live-demo >/dev/null
+"$bin_dir/loom" workspace add "$fixture" --name live-demo >/dev/null
 
 tmux new-session -d -x 160 -y 48 -s "$session" -n demo
 tmux set-option -t "$session" remain-on-exit on
@@ -56,6 +58,13 @@ tmux send-keys -t "$right" "sleep 3.5; loom watch --active" Enter
 
 cd "$repo"
 vhs demo/live.tape
+for _ in {1..60}; do
+  if ! "$bin_dir/loom" session list --workspace live-demo | grep -q recording; then
+    break
+  fi
+  sleep 1
+done
+cp "$LOOMTERM_STATE_DIR"/sessions/*/replay.html "$repo/docs/replay.html"
 poster_png="$root/poster.png"
 ffmpeg -y -ss 22 -i docs/demo.mp4 -frames:v 1 -vf 'scale=1600:-2' "$poster_png" \
   >/dev/null 2>&1

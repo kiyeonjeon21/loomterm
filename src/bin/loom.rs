@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use loomterm::agent::{
+    MAX_HOOK_INPUT_BYTES, hook_cwd, normalize_hook_event, select_active_session_id,
+};
 use loomterm::client::DaemonClient;
 use loomterm::config::{AppPaths, Settings};
 use loomterm::model::{
@@ -61,6 +64,29 @@ enum Commands {
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor,
+    #[command(hide = true)]
+    AgentEvent(AgentEventArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentEventArgs {
+    #[arg(long, value_enum)]
+    provider: AgentProviderArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentProviderArg {
+    Codex,
+    Claude,
+}
+
+impl AgentProviderArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -271,6 +297,10 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
+    if let Commands::AgentEvent(args) = &cli.command {
+        record_agent_hook_event(args.provider).await;
+        return Ok(0);
+    }
     let paths = AppPaths::discover()?;
     if let Commands::Init(args) = &cli.command
         && args.dry_run
@@ -422,7 +452,71 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Commands::AgentEvent(_) => unreachable!("agent events return before daemon setup"),
     }
+}
+
+async fn record_agent_hook_event(provider: AgentProviderArg) {
+    let mut bytes = Vec::new();
+    if std::io::stdin()
+        .take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_HOOK_INPUT_BYTES
+    {
+        hook_log("hook input read failed or exceeded the size limit");
+        return;
+    }
+    let Ok(input) = serde_json::from_slice(&bytes) else {
+        hook_log("hook input was not valid JSON");
+        return;
+    };
+    let Ok(paths) = AppPaths::discover() else {
+        hook_log("could not discover Loomterm paths");
+        return;
+    };
+    let client = DaemonClient::new(&paths.socket);
+    let session_id = match std::env::var("LOOMTERM_SESSION_ID") {
+        Ok(session_id) if !session_id.is_empty() => Some(session_id),
+        _ => {
+            let Some(cwd) = hook_cwd(&input).and_then(|cwd| Path::new(cwd).canonicalize().ok())
+            else {
+                hook_log("hook input had no usable cwd");
+                return;
+            };
+            let Ok(sessions) = client.list_agent_sessions(None, 1000).await else {
+                hook_log("could not list active Loomterm sessions");
+                return;
+            };
+            select_active_session_id(&sessions, provider.as_str(), &cwd)
+        }
+    };
+    let Some(session_id) = session_id else {
+        hook_log("no matching active Loomterm session");
+        return;
+    };
+    let Ok(Some(request)) = normalize_hook_event(provider.as_str(), &session_id, input) else {
+        hook_log("hook event was unsupported or invalid");
+        return;
+    };
+    match client.record_agent_event(request).await {
+        Ok(_) => hook_log("recorded agent event"),
+        Err(error) => hook_log(&format!("could not record agent event: {error}")),
+    }
+}
+
+fn hook_log(message: &str) {
+    let Some(path) = std::env::var_os("LOOMTERM_HOOK_LOG") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{message}");
 }
 
 async fn watch_session(client: &DaemonClient, args: WatchArgs, json: bool) -> Result<i32> {
@@ -458,9 +552,12 @@ fn print_init_plan(plan: &InitPlan, dry_run: bool, json: bool) -> Result<()> {
                     "action": if dry_run { "planned" } else { "registered" },
                 },
                 "mcp_command": plan.mcp_command,
+                "loom_command": plan.loom_command,
                 "config": {
-                    "codex": &plan.codex,
-                    "claude": &plan.claude,
+                    "codex_mcp": &plan.codex,
+                    "codex_hooks": &plan.codex_hooks,
+                    "claude_mcp": &plan.claude,
+                    "claude_hooks": &plan.claude_hooks,
                 }
             }))?
         );
@@ -472,8 +569,13 @@ fn print_init_plan(plan: &InitPlan, dry_run: bool, json: bool) -> Result<()> {
         plan.name,
         plan.root.display()
     );
-    for (agent, config) in [("codex", &plan.codex), ("claude", &plan.claude)] {
-        println!("{agent}: {:?} ({})", config.action, config.path.display());
+    for (label, config) in [
+        ("codex mcp", &plan.codex),
+        ("codex hooks", &plan.codex_hooks),
+        ("claude mcp", &plan.claude),
+        ("claude hooks", &plan.claude_hooks),
+    ] {
+        println!("{label}: {:?} ({})", config.action, config.path.display());
     }
     Ok(())
 }

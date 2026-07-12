@@ -150,3 +150,22 @@ session per agent. It validates packaging, onboarding, recording, correlation,
 redaction, and replay publication, but it does not satisfy the evidence gate for
 choosing input-required, human handoff, sandboxing, or a GUI as the next product
 investment.
+
+## Live observer validation: 2026-07-12
+
+The v0.4.0 candidate added a read-only terminal observer over the existing
+session and execution APIs. A tmux PTY smoke ran an active recording beside
+`loom watch --active`, verified incremental stdout, sent `q`, and confirmed raw
+mode and the alternate screen were restored. Wide and narrow layouts also run
+against Ratatui's deterministic test backend.
+
+The published 50-second demo records a real Codex run and observes nine
+correlated MCP executions. It includes an intentional failed discovery command,
+successful inspection and test commands, the final session transition to
+`finished`, and selected output from the durable event stream. No protocol or
+database migration was required.
+
+This closes the immediate demo visibility gap without claiming a GUI terminal.
+The observer cannot mirror the agent screen, supply input, hand control to a
+human, subscribe to session events, or operate remotely. Those boundaries remain
+evidence-gated follow-up work.

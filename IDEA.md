@@ -1,3 +1,21 @@
+## 2026-07 구현 결정: durable record의 live observer
+
+session recorder 다음에는 terminal emulator나 GUI를 만들지 않고
+`loom watch SESSION_ID|--active`를 추가한다. 이 TUI는 agent 화면을 복제하지
+않으며 기존 `SessionGet`과 cursor 기반 `ReadOutput`을 polling해 실행 목록,
+outcome, cwd, duration, stdout/stderr를 보여준다. cancel/open/export도 이미 있는
+daemon과 replay API를 호출할 뿐 새 protocol이나 DB schema를 만들지 않는다.
+
+이 경계는 데모의 핵심 질문을 더 직접적으로 드러낸다. 왼쪽의 Codex TUI와
+오른쪽의 structured execution record를 동시에 보면 Loomterm의 value는 새로운
+terminal renderer가 아니라 agent-independent process truth라는 점이 보인다.
+실제 Codex 50초 capture에서 9개 MCP execution과 session terminal 전이를
+관찰했고, tmux smoke에서 종료 후 raw mode 복구까지 검증했다.
+
+여전히 구현하지 않는 것은 screen mirror, raw keyboard 기록, session push
+subscription, remote 관찰, GUI, input/handoff, sandbox와 telemetry다. 다음 범위는
+live observer 사용 중 실제 마찰로 우선순위를 판단한다.
+
 ## 2026-07 구현 결정: agent session flight recorder
 
 GUI terminal보다 먼저 외부 coding agent를 PTY로 감싸는 session recorder를

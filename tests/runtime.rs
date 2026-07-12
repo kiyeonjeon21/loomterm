@@ -8,8 +8,8 @@ use loomterm::client::DaemonClient;
 use loomterm::config::{AppPaths, Settings};
 use loomterm::executor::ExecutionEngine;
 use loomterm::model::{
-    AgentSessionRequest, AgentSessionState, CommandSpec, ExecutionEventPayload, ExecutionOutcome,
-    ExecutionRequest, ExecutionState, Initiator, OutputStream, new_id, now_ms,
+    AgentSessionFinish, AgentSessionRequest, AgentSessionState, CommandSpec, ExecutionEventPayload,
+    ExecutionOutcome, ExecutionRequest, ExecutionState, Initiator, OutputStream, new_id, now_ms,
 };
 use loomterm::store::Store;
 use nix::sys::signal::kill;
@@ -562,6 +562,100 @@ async fn daemon_reports_workspace_statistics() {
     assert_eq!(stats.captured_bytes, 5);
     assert_eq!(stats.duration_samples, 1);
 
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn live_observer_polling_reads_correlated_execution_without_gaps() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    paths.ensure().unwrap();
+    let daemon_paths = paths.clone();
+    let daemon = tokio::spawn(async move { loomterm::daemon::run(daemon_paths, settings()).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace(
+            "observer".into(),
+            temp.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+    let session_id = new_id();
+    let directory = paths.sessions_dir.join(&session_id);
+    std::fs::create_dir(&directory).unwrap();
+    let cast_path = directory.join("recording.cast");
+    std::fs::write(
+        &cast_path,
+        "{\"version\":3,\"term\":{\"cols\":120,\"rows\":30}}\n",
+    )
+    .unwrap();
+    client
+        .create_agent_session(AgentSessionRequest {
+            id: session_id.clone(),
+            workspace_id: workspace.id.clone(),
+            agent_kind: "codex".into(),
+            name: Some("observer integration".into()),
+            command: CommandSpec::Argv {
+                program: "codex".into(),
+                args: vec!["exec".into()],
+            },
+            cwd: temp.path().to_string_lossy().into_owned(),
+            recorder_pid: std::process::id(),
+            initial_cols: 120,
+            initial_rows: 30,
+            cast_path: cast_path.to_string_lossy().into_owned(),
+            html_path: directory.join("replay.html").to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+    let mut execution_request = request(
+        workspace.id,
+        CommandSpec::Shell {
+            command: "printf one; sleep 0.05; printf two >&2; sleep 0.05; printf three".into(),
+            shell: None,
+        },
+    );
+    execution_request.initiator.session_id = Some(session_id.clone());
+    let execution = client.execute(execution_request).await.unwrap();
+
+    let mut cursor = 0;
+    let mut sequences = Vec::new();
+    loop {
+        let detail = client.get_agent_session(session_id.clone()).await.unwrap();
+        assert_eq!(detail.executions.len(), 1);
+        assert_eq!(detail.executions[0].id, execution.id);
+        let page = client
+            .read_output(execution.id.clone(), cursor, 4)
+            .await
+            .unwrap();
+        sequences.extend(page.events.iter().map(|event| event.seq));
+        cursor = page.next_seq;
+        if page.execution.state.is_terminal() && !page.has_more {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sequences.first(), Some(&1));
+    assert_eq!(sequences.last(), Some(&cursor));
+    assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+    client
+        .finish_agent_session(
+            session_id,
+            AgentSessionFinish {
+                state: AgentSessionState::Finished,
+                outcome: ExecutionOutcome::Exited { code: 0 },
+                captured_bytes: 0,
+                output_truncated: false,
+            },
+        )
+        .await
+        .unwrap();
     client.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), daemon)
         .await

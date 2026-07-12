@@ -9,17 +9,18 @@ owns process lifecycles and exposes command input, separate stdout/stderr,
 timestamps, cancellation, and terminal outcomes without requiring an agent to
 scrape a terminal screen.
 
-This first version is deliberately headless. It is not a terminal emulator, an
-agent orchestrator, or an LLM client.
+The execution runtime remains headless. Its optional terminal UI observes
+durable records; Loomterm is not a terminal emulator, agent orchestrator, or
+LLM client.
 
 ## Demo
 
 [![Codex session recorded and correlated by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
 
-[Watch the 41-second capture](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
-or [explore the interactive replay](https://kiyeonjeon21.github.io/loomterm/).
-This real Codex session fixes a failing test while five MCP executions appear
-in Loomterm's correlated timeline.
+[Watch the 50-second capture](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
+or [explore the interactive replay](https://kiyeonjeon21.github.io/loomterm/replay.html).
+This real Codex session fixes a failing test while nine MCP executions appear
+live in Loomterm's structured observer.
 
 ## What it provides
 
@@ -32,6 +33,7 @@ in Loomterm's correlated timeline.
 - Process-group cancellation with `SIGTERM` and `SIGKILL` escalation.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
 - An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
+- A responsive terminal observer for live session and execution state.
 - Self-contained HTML and asciicast exports correlated with Loomterm executions.
 
 Client disconnection does not stop a command. A daemon crash closes the private
@@ -150,6 +152,34 @@ no network dependency. Home directory paths are shortened to `~`; use repeated
 `--redact` arguments before sharing. Export cannot guarantee that arbitrary
 sensitive terminal output has been detected, so review the result first.
 
+## Live session observer
+
+Open a second terminal while an agent recording is active:
+
+```sh
+loom watch --active
+loom watch --active --workspace PROJECT
+loom watch SESSION_ID
+```
+
+`--active` selects the newest recording session in the current workspace. A
+session id and `--active` are mutually exclusive. The observer is interactive,
+so it rejects redirected input/output and `--json`.
+
+The header shows session state and duration. The execution list uses stable
+`queued`, `running`, `passed`, `failed`, and `cancelled` labels; the detail pane
+shows the selected command, cwd, outcome, duration, and merged stdout/stderr.
+Use `Tab` to change focus, arrows to select or scroll, `f` to toggle output
+follow, `c` to confirm cancellation, `o` to open a finished replay, `e` to
+export one in the current directory, and `q` to exit. Export refuses to
+overwrite an existing `loomterm-session-SESSION_ID.html` file.
+
+The UI polls session metadata every 250 ms and reads output incrementally by
+sequence cursor. Transient daemon errors remain visible and retry after one
+second. It retains at most 1 MiB of selected output for rendering; trimming the
+view never changes the durable database. A finished session stays open until
+the user exits.
+
 ## MCP setup
 
 `loom init` creates or merges project-scoped Codex and Claude Code MCP
@@ -237,6 +267,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 scripts/codex-smoke.sh
+scripts/smoke-watch-tmux.sh
 ```
 
 The integration suite also kills `loomd` with `SIGKILL`, verifies that the
@@ -258,7 +289,8 @@ user.
 ## Current scope
 
 macOS and Linux are the current targets. Loomterm can record an external agent's
-PTY, but ordinary `loom run` execution remains pipe-based and non-interactive.
-Interactive command APIs, SSH, remote daemons, GUI, ACP hosting, model
-orchestration, input-required events, and explicit human/agent handoff remain
-deferred.
+PTY and observe its structured executions in a local TUI, but ordinary
+`loom run` execution remains pipe-based and non-interactive. The observer does
+not mirror the terminal screen or accept agent input. Interactive command APIs,
+SSH, remote daemons, GUI, ACP hosting, model orchestration, input-required
+events, telemetry, and explicit human/agent handoff remain deferred.

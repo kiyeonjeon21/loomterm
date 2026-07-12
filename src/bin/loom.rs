@@ -12,6 +12,7 @@ use loomterm::model::{
     ExecutionEvent, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest, ExecutionStats,
     Initiator, new_id, now_ms,
 };
+use loomterm::onboarding::{AgentSelection, InitPlan};
 use loomterm::session::{
     RecordSpec, SessionArtifacts, export_cast, open_html, record, terminal_size, write_replay_html,
 };
@@ -34,6 +35,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Register a workspace and safely configure project-scoped agent integrations.
+    Init(InitArgs),
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
     Run(RunArgs),
@@ -56,6 +59,37 @@ enum Commands {
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor,
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    #[arg(short, long)]
+    name: Option<String>,
+    #[arg(long, value_enum, default_value_t = InitAgentArg::Both)]
+    agent: InitAgentArg,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InitAgentArg {
+    Both,
+    Codex,
+    Claude,
+    None,
+}
+
+impl InitAgentArg {
+    fn selection(self) -> AgentSelection {
+        AgentSelection {
+            codex: matches!(self, Self::Both | Self::Codex),
+            claude: matches!(self, Self::Both | Self::Claude),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +256,18 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     let paths = AppPaths::discover()?;
+    if let Commands::Init(args) = &cli.command
+        && args.dry_run
+    {
+        let plan = loomterm::onboarding::plan(
+            &args.path,
+            args.name.as_deref(),
+            args.agent.selection(),
+            args.force,
+        )?;
+        print_init_plan(&plan, true, cli.json)?;
+        return Ok(0);
+    }
     paths.ensure()?;
     let client = match &cli.command {
         Commands::Daemon(DaemonCommand::Start) => DaemonClient::connect_or_start(&paths).await?,
@@ -233,6 +279,28 @@ async fn run(cli: Cli) -> Result<i32> {
     };
 
     match cli.command {
+        Commands::Init(args) => {
+            let plan = loomterm::onboarding::plan(
+                &args.path,
+                args.name.as_deref(),
+                args.agent.selection(),
+                args.force,
+            )?;
+            let workspace = client
+                .add_workspace(plan.name.clone(), plan.root.to_string_lossy().into_owned())
+                .await?;
+            loomterm::onboarding::apply(&plan)?;
+            print_init_plan(&plan, false, cli.json)?;
+            if !cli.json {
+                println!(
+                    "workspace: {} ({})",
+                    workspace.name,
+                    short_id(&workspace.id)
+                );
+                println!("daemon: ok");
+            }
+            Ok(0)
+        }
         Commands::Workspace(command) => {
             handle_workspace(&client, command, cli.json).await?;
             Ok(0)
@@ -338,6 +406,38 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn print_init_plan(plan: &InitPlan, dry_run: bool, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": dry_run,
+                "workspace": {
+                    "name": plan.name,
+                    "root": plan.root,
+                    "action": if dry_run { "planned" } else { "registered" },
+                },
+                "mcp_command": plan.mcp_command,
+                "config": {
+                    "codex": &plan.codex,
+                    "claude": &plan.claude,
+                }
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "{}workspace: {} ({})",
+        if dry_run { "would register " } else { "" },
+        plan.name,
+        plan.root.display()
+    );
+    for (agent, config) in [("codex", &plan.codex), ("claude", &plan.claude)] {
+        println!("{agent}: {:?} ({})", config.action, config.path.display());
+    }
+    Ok(())
 }
 
 async fn restart_daemon(

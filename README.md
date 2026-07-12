@@ -1,5 +1,9 @@
 # Loomterm
 
+[![CI](https://github.com/kiyeonjeon21/loomterm/actions/workflows/ci.yml/badge.svg)](https://github.com/kiyeonjeon21/loomterm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kiyeonjeon21/loomterm?include_prereleases)](https://github.com/kiyeonjeon21/loomterm/releases)
+[![License](https://img.shields.io/github/license/kiyeonjeon21/loomterm)](LICENSE)
+
 Loomterm is a local, durable, structured command runtime for coding agents. It
 owns process lifecycles and exposes command input, separate stdout/stderr,
 timestamps, cancellation, and terminal outcomes without requiring an agent to
@@ -26,13 +30,18 @@ supervisor control pipe, which sends `SIGTERM` and then `SIGKILL` to the command
 process group. On restart, the durable record becomes `interrupted`; Loomterm
 deliberately does not reattach to an unowned process.
 
-## Build
+## Install
 
 ```sh
-cargo build --release
+brew install kiyeonjeon21/tap/loomterm
 ```
 
-The build produces four binaries:
+The public preview supports Apple Silicon, Intel macOS, and x86_64 Linux.
+Target-specific archives and `SHA256SUMS` are also available from
+[GitHub Releases](https://github.com/kiyeonjeon21/loomterm/releases). The
+preview binaries are not Apple-notarized.
+
+An installation contains four binaries:
 
 - `loomd`: execution daemon
 - `loom`: CLI client
@@ -43,36 +52,40 @@ The CLI and MCP adapter start a sibling `loomd` automatically when needed.
 
 ## Quick start
 
-Register a workspace explicitly:
+Initialize a project once. This registers the workspace and safely merges
+project-scoped Codex and Claude Code MCP settings without replacing unrelated
+configuration:
 
 ```sh
-target/release/loom workspace add . --name loomterm
+loom init .
 ```
 
-Registration is idempotent for the same name and canonical root. `workspace
-remove` deactivates command execution and project selection without deleting
-durable history; adding the same workspace again reactivates its existing id.
+Initialization is idempotent. A conflicting existing `loomterm` MCP entry is
+left untouched unless `--force` is explicit. Use `--dry-run`, `--agent codex`,
+`--agent claude`, or `--agent none` to control setup. `workspace remove`
+deactivates command execution and project selection without deleting durable
+history.
 
 Run a direct command. The CLI streams the original stdout/stderr and exits with
 the child command's exit code:
 
 ```sh
-target/release/loom run --workspace loomterm -- printf 'hello\n'
+loom run -- printf 'hello\n'
 ```
 
 Use shell mode only when shell syntax is required:
 
 ```sh
-target/release/loom run --workspace loomterm --shell 'printf out; printf err >&2; exit 7'
+loom run --shell 'printf out; printf err >&2; exit 7'
 ```
 
 Start a command without waiting, then reconnect using its execution id:
 
 ```sh
-target/release/loom run --workspace loomterm --detach -- sleep 30
-target/release/loom list --workspace loomterm
-target/release/loom logs --follow EXECUTION_ID
-target/release/loom cancel EXECUTION_ID
+loom run --detach -- sleep 30
+loom list
+loom logs --follow EXECUTION_ID
+loom cancel EXECUTION_ID
 ```
 
 `loom cancel` returns after the execution reaches a terminal `cancelled` state.
@@ -86,8 +99,8 @@ the initial execution, each event, and the terminal result.
 Summarize recent activity for one workspace:
 
 ```sh
-target/release/loom stats --workspace loomterm --days 7
-target/release/loom stats --workspace loomterm --days 7 --json
+loom stats --days 7
+loom stats --days 7 --json
 ```
 
 When `--workspace` is omitted, `loom stats` selects the most specific registered
@@ -100,8 +113,8 @@ Record an existing interactive agent from startup to exit without installing a
 GUI terminal:
 
 ```sh
-target/release/loom session record --name feature-demo -- codex
-target/release/loom session record --name review-demo -- claude
+loom session record --name feature-demo -- codex
+loom session record --name review-demo -- claude
 ```
 
 The recorder relays the real TUI through a PTY and writes a private asciicast v3
@@ -113,13 +126,13 @@ appear in the replay timeline. This repository forwards that value through its
 Codex configuration and includes `.mcp.json` for Claude Code.
 
 ```sh
-target/release/loom session list
-target/release/loom session get SESSION_ID
-target/release/loom session open SESSION_ID
-target/release/loom session export SESSION_ID --format html --output demo.html
-target/release/loom session export SESSION_ID --format cast --output demo.cast \
+loom session list
+loom session get SESSION_ID
+loom session open SESSION_ID
+loom session export SESSION_ID --format html --output demo.html
+loom session export SESSION_ID --format cast --output demo.cast \
   --redact 'sensitive literal'
-target/release/loom session delete SESSION_ID
+loom session delete SESSION_ID
 ```
 
 `session open` and HTML export regenerate the timeline from current durable
@@ -130,13 +143,12 @@ sensitive terminal output has been detected, so review the result first.
 
 ## MCP setup
 
-This repository includes project-scoped Codex and Claude Code MCP configurations
-in `.codex/config.toml` and `.mcp.json`. Register the project once, then open an
-agent from this trusted repository:
+`loom init` creates or merges project-scoped Codex and Claude Code MCP
+configurations in `.codex/config.toml` and `.mcp.json`. Open an agent from the
+trusted project after initialization:
 
 ```sh
-cargo build --release --bins
-target/release/loom workspace add . --name loomterm
+loom init .
 codex mcp get loomterm --json
 ```
 
@@ -211,6 +223,7 @@ command and environment metadata for every matching execution.
 ## Development
 
 ```sh
+cargo build --release --bins
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets

@@ -664,7 +664,8 @@ for (const execution of detail.executions) {{
   const button = document.createElement('button');
   button.className = 'execution';
   const offset = Math.max(0, (execution.created_at_ms - detail.session.created_at_ms) / 1000);
-  button.innerHTML = `<span class="command"></span><span class="facts"><span>${{execution.state}}</span><span>${{execution.duration_ms || 0}} ms</span></span>`;
+  const relation = execution.initiator.session_id === detail.session.id ? execution.state : `${{execution.state}} · handoff`;
+  button.innerHTML = `<span class="command"></span><span class="facts"><span>${{relation}}</span><span>${{execution.duration_ms || 0}} ms</span></span>`;
   button.querySelector('.command').textContent = execution.command_display;
   button.addEventListener('click', () => player.seek(offset));
   timeline.appendChild(button);

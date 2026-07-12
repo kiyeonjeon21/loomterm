@@ -15,13 +15,15 @@ LLM client.
 
 ## Demo
 
-[![Codex session recorded and correlated by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
+[![Codex-to-Claude execution handoff recorded by Loomterm](docs/poster.webp)](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
 
-[Watch the interactive Codex capture](https://kiyeonjeon21.github.io/loomterm/demo.mp4)
-or [explore the interactive replay](https://kiyeonjeon21.github.io/loomterm/replay.html).
-This real `codex --yolo` session receives a request in the TUI and fixes a
-failing test while its turn, tool actions, and MCP executions appear live in
-Loomterm's structured observer.
+[Watch the 46-second Codex-to-Claude handoff](https://kiyeonjeon21.github.io/loomterm/demo.mp4),
+[explore Claude's takeover replay](https://kiyeonjeon21.github.io/loomterm/replay.html),
+or [inspect the originating Codex replay](https://kiyeonjeon21.github.io/loomterm/replay-codex.html).
+In the real interactive capture, `codex --yolo` starts a long-running worker and
+exits. The worker stays alive; Claude Code discovers the same execution ID,
+reads its existing output, cancels it, and verifies the terminal state. The
+observer labels that cross-session execution as a handoff.
 
 ## What it provides
 

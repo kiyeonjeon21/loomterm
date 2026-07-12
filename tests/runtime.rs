@@ -8,8 +8,9 @@ use loomterm::client::DaemonClient;
 use loomterm::config::{AppPaths, Settings};
 use loomterm::executor::ExecutionEngine;
 use loomterm::model::{
-    AgentSessionFinish, AgentSessionRequest, AgentSessionState, CommandSpec, ExecutionEventPayload,
-    ExecutionOutcome, ExecutionRequest, ExecutionState, Initiator, OutputStream, new_id, now_ms,
+    AgentActionState, AgentEvent, AgentEventRequest, AgentSessionFinish, AgentSessionRequest,
+    AgentSessionState, CommandSpec, ExecutionEventPayload, ExecutionOutcome, ExecutionRequest,
+    ExecutionState, Initiator, OutputStream, new_id, now_ms,
 };
 use loomterm::store::Store;
 use nix::sys::signal::kill;
@@ -647,6 +648,175 @@ async fn live_observer_polling_reads_correlated_execution_without_gaps() {
     client
         .finish_agent_session(
             session_id,
+            AgentSessionFinish {
+                state: AgentSessionState::Finished,
+                outcome: ExecutionOutcome::Exited { code: 0 },
+                captured_bytes: 0,
+                output_truncated: false,
+            },
+        )
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_second_agent_session_can_observe_and_cancel_a_handoff_execution() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    paths.ensure().unwrap();
+    let daemon_paths = paths.clone();
+    let daemon = tokio::spawn(async move { loomterm::daemon::run(daemon_paths, settings()).await });
+    let client = wait_for_daemon(&paths).await;
+    let workspace = client
+        .add_workspace("handoff".into(), temp.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let source_id = new_id();
+    let target_id = new_id();
+    let mut session_locks = Vec::new();
+    for (id, agent) in [(&source_id, "codex"), (&target_id, "claude")] {
+        let directory = paths.sessions_dir.join(id);
+        std::fs::create_dir(&directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("active.lock"))
+            .unwrap();
+        FileExt::lock(&lock).unwrap();
+        session_locks.push(lock);
+        client
+            .create_agent_session(AgentSessionRequest {
+                id: id.clone(),
+                workspace_id: workspace.id.clone(),
+                agent_kind: agent.into(),
+                name: Some(format!("{agent} handoff")),
+                command: CommandSpec::Argv {
+                    program: agent.into(),
+                    args: Vec::new(),
+                },
+                cwd: temp.path().to_string_lossy().into_owned(),
+                recorder_pid: std::process::id(),
+                initial_cols: 120,
+                initial_rows: 30,
+                cast_path: directory
+                    .join("recording.cast")
+                    .to_string_lossy()
+                    .into_owned(),
+                html_path: directory.join("replay.html").to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut execution_request = request(
+        workspace.id,
+        CommandSpec::Shell {
+            command: "printf checkpoint; sleep 30".into(),
+            shell: None,
+        },
+    );
+    execution_request.initiator.session_id = Some(source_id.clone());
+    let execution = client.execute(execution_request).await.unwrap();
+    let mut cursor = 0;
+    let mut saw_checkpoint = false;
+    for _ in 0..20 {
+        let page = client
+            .wait(execution.id.clone(), cursor, 500, 1024)
+            .await
+            .unwrap();
+        cursor = page.next_seq;
+        saw_checkpoint |= page.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                ExecutionEventPayload::Output { data_base64, .. }
+                    if base64::engine::general_purpose::STANDARD
+                        .decode(data_base64)
+                        .is_ok_and(|data| data == b"checkpoint")
+            )
+        });
+        if saw_checkpoint {
+            break;
+        }
+    }
+    assert!(saw_checkpoint);
+    client
+        .finish_agent_session(
+            source_id.clone(),
+            AgentSessionFinish {
+                state: AgentSessionState::Finished,
+                outcome: ExecutionOutcome::Exited { code: 0 },
+                captured_bytes: 0,
+                output_truncated: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let event = |event| AgentEventRequest {
+        session_id: target_id.clone(),
+        provider: "claude".into(),
+        provider_session_id: "claude-session".into(),
+        provider_turn_id: None,
+        event,
+    };
+    client
+        .record_agent_event(event(AgentEvent::PromptSubmitted {
+            prompt: "Take over the running command".into(),
+        }))
+        .await
+        .unwrap();
+    client
+        .record_agent_event(event(AgentEvent::ToolStarted {
+            action_id: "wait-1".into(),
+            tool_name: "mcp__loomterm__loom_wait".into(),
+        }))
+        .await
+        .unwrap();
+    client
+        .record_agent_event(event(AgentEvent::ToolFinished {
+            action_id: "wait-1".into(),
+            tool_name: "mcp__loomterm__loom_wait".into(),
+            failed: false,
+            execution_id: Some(execution.id.clone()),
+        }))
+        .await
+        .unwrap();
+
+    let detail = client.get_agent_session(target_id.clone()).await.unwrap();
+    assert_eq!(detail.executions.len(), 1);
+    assert_eq!(detail.executions[0].id, execution.id);
+    assert_eq!(
+        detail.executions[0].initiator.session_id.as_deref(),
+        Some(source_id.as_str())
+    );
+    assert_eq!(detail.actions[0].state, AgentActionState::Completed);
+    assert_eq!(
+        detail.actions[0].execution_id.as_deref(),
+        Some(execution.id.as_str())
+    );
+
+    let cancelled = client.cancel(execution.id.clone()).await.unwrap();
+    assert_eq!(cancelled.state, ExecutionState::Cancelled);
+    assert_eq!(
+        client
+            .get_agent_session(target_id.clone())
+            .await
+            .unwrap()
+            .executions[0]
+            .state,
+        ExecutionState::Cancelled
+    );
+    client
+        .finish_agent_session(
+            target_id,
             AgentSessionFinish {
                 state: AgentSessionState::Finished,
                 outcome: ExecutionOutcome::Exited { code: 0 },

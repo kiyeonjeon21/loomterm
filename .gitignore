@@ -4,3 +4,7 @@
 *.db-wal
 .DS_Store
 
+
+# local, machine-specific agent integration (loom init)
+.claude/settings.local.json
+.codex/hooks.json

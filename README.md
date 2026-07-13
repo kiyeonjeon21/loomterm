@@ -35,7 +35,7 @@ execution and labels its cross-session source as a handoff.
 - Lossless stdout/stderr events with a daemon-assigned merged sequence.
 - Durable command metadata, output, exit codes, and signals in SQLite WAL.
 - Workspace-scoped cwd validation and same-user Unix socket access.
-- Process-group cancellation with `SIGTERM` and `SIGKILL` escalation.
+- Process-group cancellation with `SIGTERM` and `SIGKILL` escalation, including members that outlive the group leader.
 - A human CLI and an MCP stdio server over the same versioned core protocol.
 - An opt-in PTY recorder for replaying Codex, Claude Code, and other terminal agents.
 - Provider-neutral agent turn records populated by Codex and Claude Code lifecycle hooks.
@@ -118,6 +118,10 @@ loom cancel EXECUTION_ID
 ```
 
 `loom cancel` returns after the execution reaches a terminal `cancelled` state.
+Cancellation targets the whole process group, not just the command it started. A
+member forked while `SIGTERM` was being delivered can miss it and outlive the
+group leader, so escalation continues until the group is gone; otherwise such a
+process would keep the capture pipes open and strand the execution in `running`.
 `loom daemon status` and `loom daemon stop` never start a missing daemon. After
 upgrading the binaries, use `loom daemon restart`; it refuses to interrupt active
 executions or agent recordings unless `--force` is explicit.
@@ -204,6 +208,12 @@ loom session record --name review-demo -- claude
 The recorder relays the real TUI through a PTY and writes a private asciicast v3
 recording. It does not persist raw keyboard input. Text displayed by the agent,
 including visible prompts, is part of terminal output and is recorded.
+
+A recorder that exits without finalizing its session — a crash, or a closed
+terminal — releases the session's advisory lock, and the daemon reconciles that
+record to `interrupted` instead of leaving it `recording`. Health counts and the
+`loom daemon stop` guard follow the reconciled state, so a finished recorder does
+not hold the daemon open.
 
 For projects initialized with `loom init`, provider lifecycle hooks also attach
 structured requests and tool-action states to the active recording. Both Codex
@@ -374,8 +384,9 @@ scripts/smoke-watch-tmux.sh
 ```
 
 The integration suite also kills `loomd` with `SIGKILL`, verifies that the
-supervisor removes the command group, proves queued work cannot spawn during
-graceful shutdown, and checks cursor-exact subscription reconnects.
+supervisor removes the command group, cancels a command whose background member
+ignores `SIGTERM` and outlives the group leader, proves queued work cannot spawn
+during graceful shutdown, and checks cursor-exact subscription reconnects.
 
 Use [DOGFOOD.md](DOGFOOD.md) to run a focused local evaluation before choosing
 the next product investment.

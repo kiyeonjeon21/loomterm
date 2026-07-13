@@ -168,9 +168,21 @@ pub async fn run() -> Result<()> {
     let mut daemon_gone = false;
     let mut interrupted_reason = None;
     let mut kill_deadline = None;
+    let mut exited = None;
     let status = loop {
         tokio::select! {
-            status = child.wait() => break status?,
+            status = child.wait(), if exited.is_none() => {
+                let status = status?;
+                // The leader can die while the rest of its group lives on: a
+                // process forked as SIGTERM was delivered never received it, and
+                // it still holds the capture pipes, so leaving now would block on
+                // stdout that never reaches EOF. Stay until the grace deadline
+                // escalates to SIGKILL and the group is actually gone.
+                if kill_deadline.is_none() || !process_group_alive(pgid) {
+                    break status;
+                }
+                exited = Some(status);
+            }
             message = internal_rx.recv() => {
                 match message {
                     Some(InternalEvent::Cancel) if !cancelled => {
@@ -212,6 +224,9 @@ pub async fn run() -> Result<()> {
             } => {
                 let _ = terminate(pgid, Signal::SIGKILL);
                 kill_deadline = None;
+                if let Some(status) = exited.take() {
+                    break status;
+                }
             }
         }
     };
@@ -381,6 +396,10 @@ async fn send_and_flush(sender: &mpsc::Sender<Outgoing>, event: SupervisorEvent)
 async fn join_capture(task: tokio::task::JoinHandle<()>) -> Result<()> {
     task.await
         .map_err(|error| Error::Protocol(format!("capture task failed: {error}")))
+}
+
+fn process_group_alive(pgid: i32) -> bool {
+    killpg(Pid::from_raw(pgid), None).is_ok()
 }
 
 fn terminate(pgid: i32, signal: Signal) -> Result<()> {

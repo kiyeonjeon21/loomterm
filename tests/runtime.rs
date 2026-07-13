@@ -242,6 +242,52 @@ async fn cancels_the_running_process_group() {
     ));
 }
 
+/// The group leader can exit on SIGTERM while a member survives it and keeps the
+/// capture pipes open. Cancellation must still escalate to SIGKILL and reap the
+/// whole group, or the execution is stranded in `Running` behind stdout that
+/// never reaches EOF.
+#[tokio::test]
+async fn cancel_reaps_a_group_member_that_outlives_the_leader() {
+    let temp = TempDir::new().unwrap();
+    let store = Store::open(&temp.path().join("loom.db")).unwrap();
+    let workspace = store.add_workspace("test", temp.path()).await.unwrap();
+    let engine = ExecutionEngine::new(store, settings());
+    let execution = engine
+        .execute(request(
+            workspace.id,
+            CommandSpec::Shell {
+                command: "sh -c 'trap \"\" TERM; sleep 30' & wait".into(),
+                shell: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    loop {
+        let current = engine.store().get_execution(&execution.id).await.unwrap();
+        if current.state == ExecutionState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Give the shell time to actually fork the member that ignores SIGTERM.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pgid = engine
+        .store()
+        .get_execution(&execution.id)
+        .await
+        .unwrap()
+        .pgid
+        .unwrap();
+    let final_execution = engine.cancel(&execution.id).await.unwrap();
+    assert_eq!(final_execution.state, ExecutionState::Cancelled);
+    assert!(
+        kill(Pid::from_raw(-(pgid as i32)), None).is_err(),
+        "process group {pgid} survived cancellation"
+    );
+}
+
 #[tokio::test]
 async fn cancel_waits_for_sigkill_escalation() {
     let temp = TempDir::new().unwrap();

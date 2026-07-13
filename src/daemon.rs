@@ -474,13 +474,20 @@ fn validate_session_paths(
     Ok(())
 }
 
-async fn reconcile_agent_sessions(store: &Store) -> Result<usize> {
-    let mut interrupted = 0;
-    for session in store.active_agent_sessions().await? {
-        let Some(directory) = Path::new(&session.cast_path).parent() else {
-            continue;
-        };
-        let lock_path = directory.join("active.lock");
+const RECORDER_LOCK_ATTEMPTS: usize = 3;
+const RECORDER_LOCK_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Takes the session's advisory lock, which only succeeds once the recorder has
+/// released it.
+///
+/// A released `flock` lives on the open file description, not the descriptor, so
+/// it stays held while any inherited copy is open. `loomd` forks a child for
+/// every execution and each child carries a copy of this descriptor until it
+/// execs, which makes a single `WouldBlock` too weak to prove the recorder is
+/// still alive: probing inside that window strands a finished session in
+/// `recording` and makes the shutdown guard refuse. Retry before believing it.
+async fn claim_released_session_lock(lock_path: &Path) -> Result<Option<File>> {
+    for attempt in 1..=RECORDER_LOCK_ATTEMPTS {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -488,27 +495,42 @@ async fn reconcile_agent_sessions(store: &Store) -> Result<usize> {
             .truncate(false)
             .open(lock_path)?;
         match FileExt::try_lock(&lock) {
-            Ok(()) => {
-                let captured_bytes = cast_output_bytes(Path::new(&session.cast_path))
-                    .unwrap_or(session.captured_bytes);
-                store
-                    .finish_agent_session(
-                        &session.id,
-                        AgentSessionFinish {
-                            state: AgentSessionState::Interrupted,
-                            outcome: ExecutionOutcome::Interrupted {
-                                reason: "session recorder exited before finalization".into(),
-                            },
-                            captured_bytes,
-                            output_truncated: session.output_truncated,
-                        },
-                    )
-                    .await?;
-                interrupted += 1;
-            }
+            Ok(()) => return Ok(Some(lock)),
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
         }
+        if attempt < RECORDER_LOCK_ATTEMPTS {
+            tokio::time::sleep(RECORDER_LOCK_BACKOFF).await;
+        }
+    }
+    Ok(None)
+}
+
+async fn reconcile_agent_sessions(store: &Store) -> Result<usize> {
+    let mut interrupted = 0;
+    for session in store.active_agent_sessions().await? {
+        let Some(directory) = Path::new(&session.cast_path).parent() else {
+            continue;
+        };
+        let Some(_lock) = claim_released_session_lock(&directory.join("active.lock")).await? else {
+            continue;
+        };
+        let captured_bytes =
+            cast_output_bytes(Path::new(&session.cast_path)).unwrap_or(session.captured_bytes);
+        store
+            .finish_agent_session(
+                &session.id,
+                AgentSessionFinish {
+                    state: AgentSessionState::Interrupted,
+                    outcome: ExecutionOutcome::Interrupted {
+                        reason: "session recorder exited before finalization".into(),
+                    },
+                    captured_bytes,
+                    output_truncated: session.output_truncated,
+                },
+            )
+            .await?;
+        interrupted += 1;
     }
     Ok(interrupted)
 }

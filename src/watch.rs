@@ -1,15 +1,10 @@
 use std::collections::VecDeque;
-use std::io::{IsTerminal, Stdout, stdout};
+use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use crossterm::{cursor::Hide, cursor::Show};
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -26,6 +21,7 @@ use crate::model::{
     OutputStream, now_ms,
 };
 use crate::session::{open_html, write_replay_html};
+use crate::terminal::TerminalSession;
 use crate::{Error, Result};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -289,12 +285,7 @@ impl WatchState {
 }
 
 pub fn ensure_interactive() -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(Error::InvalidRequest(
-            "`loom watch` requires an interactive terminal".into(),
-        ));
-    }
-    Ok(())
+    crate::terminal::ensure_interactive("loom watch")
 }
 
 pub fn active_session_id(sessions: &[AgentSession]) -> Option<String> {
@@ -306,7 +297,7 @@ pub fn active_session_id(sessions: &[AgentSession]) -> Option<String> {
 
 pub async fn run(client: &DaemonClient, detail: AgentSessionDetail) -> Result<()> {
     ensure_interactive()?;
-    let mut session = TerminalSession::enter()?;
+    let mut session = TerminalSession::enter(false)?;
     let result = run_loop(client, &mut session.terminal, detail).await;
     session.terminal.show_cursor()?;
     result
@@ -468,37 +459,6 @@ fn sanitize_output(value: &str) -> String {
             character => character,
         })
         .collect()
-}
-
-struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalSession {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        match Terminal::new(CrosstermBackend::new(output)) {
-            Ok(terminal) => Ok(Self { terminal }),
-            Err(error) => {
-                let _ = disable_raw_mode();
-                let mut output = stdout();
-                let _ = execute!(output, LeaveAlternateScreen, Show);
-                Err(error.into())
-            }
-        }
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
-    }
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, state: &mut WatchState) {

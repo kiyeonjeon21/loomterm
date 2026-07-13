@@ -55,6 +55,25 @@ fn watch_cli_enforces_interactive_contract() {
 }
 
 #[test]
+fn operator_ui_is_the_default_and_requires_a_terminal() {
+    let temp = TempDir::new().unwrap();
+    for args in [Vec::<&str>::new(), vec!["ui"]] {
+        assert_cmd::cargo::cargo_bin_cmd!("loom")
+            .env("LOOMTERM_STATE_DIR", temp.path().join("state"))
+            .env("LOOMTERM_RUNTIME_DIR", temp.path().join("run"))
+            .env("LOOMTERM_CONFIG", temp.path().join("config.toml"))
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "`loom ui` requires an interactive terminal",
+            ));
+        assert!(!temp.path().join("state").exists());
+        assert!(!temp.path().join("run").exists());
+    }
+}
+
+#[test]
 fn strict_agent_hook_denies_native_bash_without_contacting_the_daemon() {
     let input = serde_json::json!({
         "session_id": "provider-session",

@@ -204,7 +204,10 @@ injects the source request and execution metadata. Claude lists that same
 execution, reads its accumulated checkpoints, cancels it, and verifies the
 `cancelled` state without starting a replacement process or using native Bash.
 
-The 80-second capture and both HTML replays passed automated assertions for the
+The current 80-second capture places the real provider TUI above the workspace
+operator UI, so session state, the shared execution, persisted output, and the
+handoff source remain visible throughout the transition. The capture and both
+HTML replays passed automated assertions for the
 exact prompts, completed turns, shared execution ID, source-session ownership,
 target-session action link, final state, session ordering, and a clean fixture
 worktree. The workflow also asserts that no native Bash action was recorded in
@@ -214,3 +217,28 @@ against a real daemon. This validates a local launcher-driven continuity flow
 between supported agents. It does not yet validate external demand, remote
 handoff, autonomous scheduling, or a GUI terminal as the next product
 investment.
+
+## Operator UI validation: 2026-07-13
+
+The workspace operator UI makes bare `loom` the control surface for durable
+work without turning Loomterm into a terminal emulator. `All work` includes
+session-linked and standalone executions, while recorded Codex and Claude
+sessions provide a narrower view. Responsive Ratatui tests cover 80, 120, and
+160 columns; keyboard navigation, global search, the command palette, mouse
+selection, output following, cancellation, replay actions, and provider modals
+share one state model.
+
+An isolated tmux smoke creates passed, failed, running, and session-linked
+executions. A fake Codex provider starts durable work and exits, the dashboard
+returns with that completed session selected, and the handoff preview shows the
+source plus its active execution before a fake Claude provider takes over. The
+test then verifies the new Claude session and terminal restoration. This exposed
+and fixed an older recorder issue where its blocking stdin relay could consume
+the first key after returning from an agent; the relay now uses bounded polling
+and is stopped and joined on every recorder exit path.
+
+The UI uses the existing session, execution, output cursor, cancellation, and
+replay APIs. No database or wire-protocol migration was needed. It still does
+not embed an agent terminal, editor, worktree manager, remote daemon, or model
+orchestrator; provider TUIs temporarily own the terminal and the operator UI
+resumes after they exit.

@@ -242,3 +242,94 @@ replay APIs. No database or wire-protocol migration was needed. It still does
 not embed an agent terminal, editor, worktree manager, remote daemon, or model
 orchestrator; provider TUIs temporarily own the terminal and the operator UI
 resumes after they exit.
+
+## First author use: 2026-07-13
+
+Every entry above validates a feature against a fixture. None of them is the
+30-45 minute session of real development work this protocol asks for. Before
+this run the local database held 15 executions and 0 agent sessions, all of them
+from the automated probe of 2026-07-12, with no write since 17:18 that day. This
+repository had also never enabled its own provider hooks: `.claude/settings.json`
+carried no `hooks` block, and `.mcp.json` still started `loom-mcp` through
+`cargo run`. The tool had shipped a demo, a Homebrew formula, an operator UI, and
+nineteen pull requests without its author routing one day of work through it.
+
+Enabling the hooks and running a single real command — `cargo test` through
+`loom_run` — immediately failed a test that CI reports green, which led to two
+runtime defects. Both are gate 1 ("lost, duplicated, orphaned, or cannot be
+resumed correctly"), so gate 1 fires and packaging, PTY, and sandboxing do not.
+
+### Cancellation orphaned the process group
+
+`cancel` signals the process group with `SIGTERM` and then left the supervisor
+loop as soon as the group leader exited, abandoning the pending escalation:
+
+```rust
+status = child.wait() => break status?,
+```
+
+A member forked while `SIGTERM` was being delivered is absent from the kernel's
+member enumeration and never receives it. The leader dies, the loop breaks, and
+`SIGKILL` never runs. The survivor still holds the write end of the capture
+pipes, so `join_capture` never observes EOF, the execution is stranded in
+`running`, and `cancel` returns `Timeout` after its whole
+`cancel_grace_ms + SHUTDOWN_SETTLE_MS` budget. Captured at the moment of failure:
+
+```
+cancel=Timeout state=Running outcome=None pid_alive=false pgid_alive=true
+```
+
+The leader is dead and the group is alive. This is reachable from ordinary use:
+cancelling any command that backgrounds a child can strand the execution and leak
+the process. It contradicts the runtime's central claim that it owns process
+lifecycles and reaps the group, and no fixture in this file caught it.
+
+### A released session lock still read as held
+
+`reconcile_agent_sessions` treated one `try_lock` on `active.lock` as proof the
+recorder was alive. `flock` is held on the open file description, and `loomd`
+forks a child for every execution that carries a copy of that descriptor until it
+execs, so inside that window a released lock still answers `WouldBlock`. Measured
+with a minimal open / lock / close / open / `try_lock` loop:
+
+| Condition | Transient `WouldBlock` |
+| --- | ---: |
+| Quiet process | 0 / 100,000 |
+| Spawning children concurrently | 6 / 5,000 |
+
+A finished session therefore stayed in `recording`, and the shutdown guard
+refused with `daemon has 1 active agent session(s)`.
+
+### Result
+
+| Check | Before | After |
+| --- | --- | --- |
+| `daemon_reports_and_guards_active_agent_sessions` | flaked 5 / 20 suite runs | 80 / 80 |
+| `cancel_reaps_a_group_member_that_outlives_the_leader` | fails in 5.61 s | passes in 0.58 s |
+| Runtime suite, parallel and serial | intermittent | 80 / 80 and 20 / 20 |
+
+Both defects were reproduced deterministically before being fixed, and the
+regression test strands the execution for the full timeout against the old
+supervisor. Merged as `5db5fde` (#20).
+
+### Friction
+
+| Task | Signal | Workaround | Product implication |
+| --- | --- | --- | --- |
+| Enabling hooks | `loom init` writes absolute binary paths into `.mcp.json`, `.claude/settings.json`, and `.codex/config.toml`, all of which this repository tracks | Keep the generated hook files untracked | Onboarding leaks machine-local paths into a shared repository |
+| Resolving the binary | The released Homebrew 0.5.0 shadowed the local build on `PATH` and lacks `ui`, `agent`, and `handoff`, so `loom ui` failed with an unknown subcommand | Uninstall the formula while developing | Version skew between the tap and the working tree is silent |
+| `loom daemon restart` | Prints a raw Rust `Debug` dump of `Health` where `loom doctor` prints a formatted summary | None needed | Cosmetic, but the daemon subcommands do not share one output contract |
+
+### What this does not settle
+
+The run proves the runtime had reliability defects that only real use exposed. It
+does not establish demand. The harder observation is that the author could not
+say what he would type on an ordinary morning: the tool has commands but no
+ritual, no `git status` or `docker ps` equivalent that earns a daily open. Until
+`loom ui` is opened because a real question arose — not because a protocol said
+to — the product hypothesis stays unvalidated, and adding surface area cannot
+validate it.
+
+The next investment is therefore continued real use with hooks enabled and no new
+features, recording which moments actually send the operator to Loomterm. If no
+such moment arrives, that is the finding.
